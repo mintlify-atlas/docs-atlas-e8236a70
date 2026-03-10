@@ -1,0 +1,177 @@
+{
+  "projectType": "saas",
+  "projectName": "Nectr AI PR Review Agent",
+  "projectDescription": "AI-powered GitHub PR review agent that automatically reviews pull requests with Claude, stores context in Neo4j and Mem0, and integrates with Linear, Sentry, and Slack via MCP.",
+  "theme": "aspen",
+  "primaryColor": "#6366f1",
+  "lightColor": "#818cf8",
+  "darkColor": "#4f46e5",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/pr-review-flow",
+              "features/knowledge-graph",
+              "features/semantic-memory",
+              "features/ai-agents"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/github",
+              "integrations/mcp-overview",
+              "integrations/linear",
+              "integrations/sentry",
+              "integrations/slack"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/oauth-setup",
+              "configuration/webhooks",
+              "configuration/feature-flags"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/railway",
+              "deployment/vercel",
+              "deployment/local-development",
+              "deployment/self-hosting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Authentication",
+            "pages": [
+              "api/auth/github-oauth",
+              "api/auth/jwt",
+              "api/auth/user"
+            ]
+          },
+          {
+            "group": "Repositories",
+            "pages": [
+              "api/repos/list",
+              "api/repos/connect",
+              "api/repos/disconnect",
+              "api/repos/rescan"
+            ]
+          },
+          {
+            "group": "Reviews",
+            "pages": [
+              "api/reviews/list",
+              "api/reviews/details"
+            ]
+          },
+          {
+            "group": "Analytics",
+            "pages": [
+              "api/analytics/summary",
+              "api/analytics/contributors",
+              "api/analytics/timeline"
+            ]
+          },
+          {
+            "group": "Memory",
+            "pages": [
+              "api/memory/list",
+              "api/memory/create",
+              "api/memory/delete",
+              "api/memory/project-map"
+            ]
+          },
+          {
+            "group": "Webhooks",
+            "pages": [
+              "api/webhooks/github"
+            ]
+          },
+          {
+            "group": "MCP Server",
+            "pages": [
+              "api/mcp/overview",
+              "api/mcp/tools",
+              "api/mcp/resources"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Architecture",
+        "groups": [
+          {
+            "group": "System Design",
+            "pages": [
+              "architecture/overview",
+              "architecture/backend",
+              "architecture/frontend",
+              "architecture/data-flow"
+            ]
+          },
+          {
+            "group": "Components",
+            "pages": [
+              "architecture/services",
+              "architecture/database-schema",
+              "architecture/neo4j-graph",
+              "architecture/mcp-client"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Automated PR review with Claude Sonnet 4.6",
+    "Neo4j knowledge graph for file experts and related PRs",
+    "Mem0 semantic memory for project patterns and developer habits",
+    "MCP server exposing PR reviews, verdicts, and repo health",
+    "MCP client pulling context from Linear, Sentry, and Slack",
+    "GitHub OAuth authentication with JWT",
+    "FastAPI backend with async PostgreSQL and Neo4j",
+    "Next.js 15 frontend with React 19 and TailwindCSS 4",
+    "Parallel review agents mode with specialized security, performance, and style agents"
+  ],
+  "publicApiSurface": [
+    "POST /api/v1/webhooks/github",
+    "GET /api/v1/repos",
+    "POST /api/v1/repos/{owner}/{repo}/install",
+    "POST /api/v1/repos/{owner}/{repo}/rescan",
+    "DELETE /api/v1/repos/{owner}/{repo}/install",
+    "GET /api/v1/reviews",
+    "GET /api/v1/analytics",
+    "GET /api/v1/memory",
+    "POST /api/v1/memory",
+    "DELETE /api/v1/memory/{id}",
+    "GET /api/v1/memory/project-map",
+    "GET /auth/github",
+    "GET /auth/github/callback",
+    "GET /auth/me",
+    "POST /auth/logout",
+    "GET /mcp/sse",
+    "POST /mcp/messages",
+    "GET /health"
+  ]
+}
