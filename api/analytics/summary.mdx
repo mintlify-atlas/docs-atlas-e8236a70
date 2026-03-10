@@ -1,0 +1,240 @@
+---
+title: 'Analytics Summary'
+api: 'GET /api/v1/analytics/summary'
+description: 'Get high-level analytics summary across all reviewed PRs'
+---
+
+## Overview
+
+Retrieve comprehensive analytics including total reviews, success rates, processing times, and repository metrics. Data is deduplicated by unique PR to provide accurate insights.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+## Response
+
+<ResponseField name="total_reviews" type="integer">
+  Total number of unique PRs reviewed (deduplicated by repo + PR number)
+</ResponseField>
+
+<ResponseField name="success_rate" type="float">
+  Percentage of reviews that completed successfully (0-100)
+</ResponseField>
+
+<ResponseField name="avg_processing_seconds" type="float">
+  Average time in seconds to complete a review
+</ResponseField>
+
+<ResponseField name="connected_repos" type="integer">
+  Number of active repositories connected to your account
+</ResponseField>
+
+<ResponseField name="reviews_today" type="integer">
+  Number of PRs reviewed today
+</ResponseField>
+
+<ResponseField name="reviews_this_week" type="integer">
+  Number of PRs reviewed in the last 7 days
+</ResponseField>
+
+<ResponseField name="avg_merge_hours" type="float">
+  Average time in hours from PR creation to merge (null if no merged PRs)
+</ResponseField>
+
+<ResponseField name="avg_pr_size" type="integer">
+  Average PR size in lines changed (additions + deletions)
+</ResponseField>
+
+<ResponseField name="last_week_activity" type="array">
+  Array of PRs reviewed in the last 7 days
+</ResponseField>
+
+<ResponseField name="last_week_activity[].pr_number" type="integer">
+  Pull request number
+</ResponseField>
+
+<ResponseField name="last_week_activity[].title" type="string">
+  PR title
+</ResponseField>
+
+<ResponseField name="last_week_activity[].author" type="string">
+  GitHub username of the author
+</ResponseField>
+
+<ResponseField name="last_week_activity[].repo_name" type="string">
+  Repository full name (owner/repo)
+</ResponseField>
+
+<ResponseField name="last_week_activity[].state" type="string">
+  Current PR state: `open`, `merged`, or `closed`
+</ResponseField>
+
+<ResponseField name="last_week_activity[].additions" type="integer">
+  Lines added in the PR
+</ResponseField>
+
+<ResponseField name="last_week_activity[].deletions" type="integer">
+  Lines deleted in the PR
+</ResponseField>
+
+<ResponseField name="last_week_activity[].changed_files" type="integer">
+  Number of files modified in the PR
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X GET "https://api.nectr.ai/api/v1/analytics/summary" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import requests
+
+response = requests.get(
+    "https://api.nectr.ai/api/v1/analytics/summary",
+    headers={"Authorization": f"Bearer {token}"}
+)
+
+summary = response.json()
+print(f"Total reviews: {summary['total_reviews']}")
+print(f"Success rate: {summary['success_rate']}%")
+print(f"Avg processing time: {summary['avg_processing_seconds']}s")
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://api.nectr.ai/api/v1/analytics/summary',
+  {
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  }
+);
+
+const summary = await response.json();
+console.log(`Total reviews: ${summary.total_reviews}`);
+console.log(`Success rate: ${summary.success_rate}%`);
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "total_reviews": 127,
+  "success_rate": 94.5,
+  "avg_processing_seconds": 45.3,
+  "connected_repos": 5,
+  "reviews_today": 8,
+  "reviews_this_week": 23,
+  "avg_merge_hours": 18.7,
+  "avg_pr_size": 342,
+  "last_week_activity": [
+    {
+      "pr_number": 42,
+      "title": "Add user authentication endpoints",
+      "author": "johndoe",
+      "repo_name": "acme/api-server",
+      "state": "open",
+      "additions": 245,
+      "deletions": 18,
+      "changed_files": 8
+    },
+    {
+      "pr_number": 41,
+      "title": "Fix database connection pooling",
+      "author": "janedoe",
+      "repo_name": "acme/api-server",
+      "state": "merged",
+      "additions": 87,
+      "deletions": 43,
+      "changed_files": 3
+    }
+  ]
+}
+```
+
+## Metrics Explanation
+
+### Success Rate
+
+Calculated as:
+```
+success_rate = (completed_reviews / total_reviews) * 100
+```
+
+Where:
+- `completed_reviews`: Reviews with status = "completed"
+- `total_reviews`: Total unique PRs (deduplicated by repo + PR number)
+
+### Average Processing Time
+
+Average duration from `started_at` to `completed_at` for all completed workflow runs. Excludes outliers (>5 minutes) to prevent skewing from stuck processes.
+
+### Average Merge Hours
+
+Calculated only for merged PRs with valid timestamps. Excludes outliers (>30 days) to prevent skewing from stale PRs. Returns `null` if no merged PRs exist.
+
+### PR Size
+
+Sum of additions and deletions for each PR:
+```
+pr_size = additions + deletions
+```
+
+## Use Cases
+
+### Dashboard Overview
+
+```python
+summary = get_analytics_summary()
+
+print(f"📊 Analytics Dashboard")
+print(f"Total Reviews: {summary['total_reviews']}")
+print(f"Success Rate: {summary['success_rate']}%")
+print(f"Avg Processing: {summary['avg_processing_seconds']}s")
+print(f"Connected Repos: {summary['connected_repos']}")
+print(f"")
+print(f"📈 Recent Activity")
+print(f"Today: {summary['reviews_today']} reviews")
+print(f"This Week: {summary['reviews_this_week']} reviews")
+print(f"")
+print(f"⏱️ PR Metrics")
+print(f"Avg Merge Time: {summary['avg_merge_hours']:.1f} hours")
+print(f"Avg PR Size: {summary['avg_pr_size']} lines")
+```
+
+### Monitor Team Velocity
+
+```python
+summary = get_analytics_summary()
+
+if summary['avg_merge_hours']:
+    if summary['avg_merge_hours'] < 24:
+        print("✅ Excellent merge velocity! PRs are being merged quickly.")
+    elif summary['avg_merge_hours'] < 72:
+        print("⚠️ Moderate merge velocity. Consider reviewing PRs faster.")
+    else:
+        print("❌ Slow merge velocity. PRs are taking too long to merge.")
+```
+
+### Activity Tracking
+
+```python
+summary = get_analytics_summary()
+
+print("Recent PR Activity:")
+for pr in summary['last_week_activity']:
+    status_emoji = {'open': '🔵', 'merged': '✅', 'closed': '❌'}[pr['state']]
+    print(f"{status_emoji} #{pr['pr_number']}: {pr['title']}")
+    print(f"   Author: {pr['author']} | Changes: +{pr['additions']} -{pr['deletions']}")
+```

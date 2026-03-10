@@ -1,0 +1,483 @@
+---
+title: 'Local Development'
+description: 'Run Nectr locally for development and testing'
+icon: 'laptop-code'
+---
+
+## Overview
+
+This guide walks you through setting up Nectr for local development. You'll run the FastAPI backend and Next.js frontend on your machine with hot-reload for rapid iteration.
+
+## Prerequisites
+
+Ensure you have these installed:
+
+- **Python 3.14+** ([download](https://www.python.org/downloads/))
+- **Node.js 20+** and **npm** ([download](https://nodejs.org/))
+- **Git** ([download](https://git-scm.com/))
+- **PostgreSQL** (or use a cloud provider like Supabase)
+- **Neo4j** (local or [AuraDB free tier](https://neo4j.com/cloud))
+
+## Clone Repository
+
+```bash
+git clone https://github.com/yourusername/nectr.git
+cd nectr
+```
+
+## Backend Setup
+
+<Steps>
+  <Step title="Create Virtual Environment">
+    Create and activate a Python virtual environment:
+    
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate  # On Windows: venv\Scripts\activate
+    ```
+  </Step>
+
+  <Step title="Install Dependencies">
+    Install all required Python packages:
+    
+    ```bash
+    pip install -r requirements.txt
+    ```
+    
+    <Note>
+    This installs FastAPI, Uvicorn, SQLAlchemy, Neo4j driver, Anthropic SDK, and all other dependencies.
+    </Note>
+  </Step>
+
+  <Step title="Configure Environment Variables">
+    Copy the example environment file and fill in your values:
+    
+    ```bash
+    cp .env.example .env
+    ```
+    
+    Edit `.env` and set the required variables:
+    
+    <CodeGroup>
+    ```bash Required
+    # AI
+    ANTHROPIC_API_KEY=sk-ant-...
+    
+    # Database (local or Supabase)
+    DATABASE_URL=postgresql+asyncpg://localhost:5432/nectr
+    
+    # GitHub OAuth App
+    GITHUB_CLIENT_ID=...
+    GITHUB_CLIENT_SECRET=...
+    GITHUB_PAT=ghp_...  # Classic token with 'repo' scope
+    
+    # Auth
+    SECRET_KEY=your-generated-secret
+    
+    # Neo4j (local or AuraDB)
+    NEO4J_URI=bolt://localhost:7687
+    NEO4J_USERNAME=neo4j
+    NEO4J_PASSWORD=your-password
+    
+    # Mem0
+    MEM0_API_KEY=m0-...
+    
+    # Local URLs
+    BACKEND_URL=http://localhost:8000
+    FRONTEND_URL=http://localhost:3000
+    
+    # Environment
+    APP_ENV=development
+    DEBUG=True
+    LOG_LEVEL=DEBUG
+    ```
+    
+    ```bash Optional
+    # MCP integrations (skip if not testing)
+    LINEAR_MCP_URL=...
+    LINEAR_API_KEY=...
+    SENTRY_MCP_URL=...
+    SENTRY_AUTH_TOKEN=...
+    SLACK_MCP_URL=...
+    
+    # Feature flags
+    PARALLEL_REVIEW_AGENTS=false
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Set Up Local PostgreSQL">
+    If using local PostgreSQL:
+    
+    ```bash
+    # Create database
+    createdb nectr
+    
+    # Update .env
+    DATABASE_URL=postgresql+asyncpg://localhost:5432/nectr
+    ```
+    
+    Or use **Supabase** for a cloud database:
+    1. Create a free project at [supabase.com](https://supabase.com)
+    2. Get the connection string from **Settings** → **Database**
+    3. Use the **Session Mode** pooler (port 5432)
+  </Step>
+
+  <Step title="Run Database Migrations">
+    Apply all database migrations:
+    
+    ```bash
+    alembic upgrade head
+    ```
+    
+    This creates all required tables:
+    - `users`
+    - `installations`
+    - `events`
+    - `workflows`
+    - `oauth_states`
+  </Step>
+
+  <Step title="Start Backend Server">
+    Run the FastAPI backend with hot-reload:
+    
+    ```bash
+    uvicorn app.main:app --reload --port 8000
+    ```
+    
+    You should see:
+    ```
+    INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+    INFO:     Started reloader process [12345] using StatReload
+    INFO:     Started server process [12346]
+    INFO:     Waiting for application startup.
+    INFO:     Application startup complete.
+    ```
+  </Step>
+
+  <Step title="Verify Backend">
+    Test the health endpoint:
+    
+    ```bash
+    curl http://localhost:8000/health
+    ```
+    
+    Expected response:
+    ```json
+    {
+      "status": "healthy",
+      "database": "connected",
+      "neo4j": "connected",
+      "uptime_seconds": 5.23
+    }
+    ```
+  </Step>
+</Steps>
+
+## Frontend Setup
+
+<Steps>
+  <Step title="Navigate to Frontend Directory">
+    ```bash
+    cd nectr-web
+    ```
+  </Step>
+
+  <Step title="Install Dependencies">
+    ```bash
+    npm install
+    ```
+    
+    This installs Next.js 15, React 19, TailwindCSS 4, and all other dependencies.
+  </Step>
+
+  <Step title="Configure Environment">
+    Copy the example environment file:
+    
+    ```bash
+    cp .env.example .env.local
+    ```
+    
+    Edit `.env.local`:
+    ```bash
+    NEXT_PUBLIC_API_URL=http://localhost:8000
+    ```
+    
+    <Warning>
+    Do NOT include a trailing slash in `NEXT_PUBLIC_API_URL`.
+    </Warning>
+  </Step>
+
+  <Step title="Start Development Server">
+    ```bash
+    npm run dev
+    ```
+    
+    The Next.js dev server starts on port 3000:
+    ```
+    ▲ Next.js 15.0.0
+    - Local:        http://localhost:3000
+    - Network:      http://192.168.1.100:3000
+    
+    ✓ Ready in 2.3s
+    ```
+  </Step>
+
+  <Step title="Access Frontend">
+    Open your browser and navigate to:
+    ```
+    http://localhost:3000
+    ```
+    
+    You should see the Nectr landing page.
+  </Step>
+</Steps>
+
+## GitHub OAuth Setup
+
+To test authentication locally:
+
+<Steps>
+  <Step title="Create GitHub OAuth App">
+    1. Go to [github.com/settings/developers](https://github.com/settings/developers)
+    2. Click **New OAuth App**
+    3. Fill in the details:
+       - **Application name:** Nectr Local Dev
+       - **Homepage URL:** `http://localhost:3000`
+       - **Authorization callback URL:** `http://localhost:8000/auth/github/callback`
+    4. Click **Register application**
+  </Step>
+
+  <Step title="Get Credentials">
+    Copy the **Client ID** and generate a **Client Secret**.
+    
+    Update your backend `.env`:
+    ```bash
+    GITHUB_CLIENT_ID=your_client_id
+    GITHUB_CLIENT_SECRET=your_client_secret
+    ```
+  </Step>
+
+  <Step title="Create Personal Access Token">
+    Create a classic token at [github.com/settings/tokens](https://github.com/settings/tokens):
+    
+    1. Click **Generate new token** → **Classic**
+    2. Select scope: `repo` (full control of private repositories)
+    3. Generate and copy the token
+    
+    Update your backend `.env`:
+    ```bash
+    GITHUB_PAT=ghp_your_token
+    ```
+  </Step>
+
+  <Step title="Test Authentication">
+    1. Go to `http://localhost:3000`
+    2. Click **Sign in with GitHub**
+    3. Authorize the app
+    4. You should be redirected to `/dashboard`
+  </Step>
+</Steps>
+
+## Development Workflow
+
+### Hot Reload
+
+Both backend and frontend support hot-reload:
+
+- **Backend:** Uvicorn automatically restarts when you edit Python files
+- **Frontend:** Next.js Fast Refresh updates the browser instantly
+
+### Project Structure
+
+```bash
+Nectr/
+├── app/                    # FastAPI backend
+│   ├── main.py            # Entry point
+│   ├── core/              # Config, database, Neo4j
+│   ├── models/            # SQLAlchemy models
+│   ├── api/v1/            # API routes
+│   ├── auth/              # Authentication
+│   ├── services/          # Business logic
+│   ├── integrations/      # GitHub, MCP
+│   └── mcp/               # MCP server & client
+├── alembic/               # Database migrations
+├── nectr-web/             # Next.js frontend
+│   └── src/
+│       ├── app/           # App Router pages
+│       ├── components/    # React components
+│       ├── hooks/         # Custom hooks
+│       └── lib/           # API client
+├── requirements.txt       # Python dependencies
+└── .env                   # Backend environment
+```
+
+### Common Development Tasks
+
+<AccordionGroup>
+  <Accordion title="Create a new database migration">
+    ```bash
+    alembic revision --autogenerate -m "Add new column"
+    alembic upgrade head
+    ```
+  </Accordion>
+
+  <Accordion title="Reset database">
+    ```bash
+    alembic downgrade base
+    alembic upgrade head
+    ```
+  </Accordion>
+
+  <Accordion title="Test API endpoints">
+    Use `curl` or tools like Postman/Insomnia:
+    
+    ```bash
+    # Get current user
+    curl http://localhost:8000/auth/me -H "Cookie: token=your_jwt"
+    
+    # List repos
+    curl http://localhost:8000/api/v1/repos -H "Cookie: token=your_jwt"
+    ```
+  </Accordion>
+
+  <Accordion title="View logs">
+    Backend logs appear in the terminal where you ran `uvicorn`. Increase verbosity:
+    
+    ```bash
+    LOG_LEVEL=DEBUG uvicorn app.main:app --reload
+    ```
+  </Accordion>
+
+  <Accordion title="Run type checks">
+    ```bash
+    # Backend
+    mypy app/
+    
+    # Frontend
+    cd nectr-web
+    npm run type-check
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Testing Webhooks Locally
+
+GitHub webhooks require a public URL. Use **ngrok** to expose your local server:
+
+<Steps>
+  <Step title="Install ngrok">
+    Download from [ngrok.com](https://ngrok.com) or install via package manager:
+    
+    ```bash
+    brew install ngrok  # macOS
+    ```
+  </Step>
+
+  <Step title="Start ngrok Tunnel">
+    ```bash
+    ngrok http 8000
+    ```
+    
+    Copy the public URL (e.g., `https://abc123.ngrok.io`).
+  </Step>
+
+  <Step title="Update Environment Variables">
+    Update your `.env` temporarily:
+    
+    ```bash
+    BACKEND_URL=https://abc123.ngrok.io
+    ```
+  </Step>
+
+  <Step title="Configure GitHub Webhook">
+    In your GitHub repo settings:
+    
+    1. Go to **Settings** → **Webhooks** → **Add webhook**
+    2. Set **Payload URL:** `https://abc123.ngrok.io/api/v1/webhooks/github`
+    3. Set **Content type:** `application/json`
+    4. Set **Secret:** (generate a random string)
+    5. Select events: `Pull requests`
+    6. Click **Add webhook**
+  </Step>
+
+  <Step title="Test Webhook">
+    Open or update a PR in your repo. Check the backend logs to see the webhook event.
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Port already in use">
+    If port 8000 or 3000 is in use:
+    
+    ```bash
+    # Backend (different port)
+    uvicorn app.main:app --reload --port 8001
+    
+    # Frontend (different port)
+    PORT=3001 npm run dev
+    ```
+    
+    Update `NEXT_PUBLIC_API_URL` and `FRONTEND_URL` accordingly.
+  </Accordion>
+
+  <Accordion title="Database connection errors">
+    Ensure PostgreSQL is running:
+    
+    ```bash
+    # macOS
+    brew services start postgresql
+    
+    # Linux
+    sudo systemctl start postgresql
+    ```
+    
+    Verify connection string in `.env`.
+  </Accordion>
+
+  <Accordion title="Neo4j connection errors">
+    If using local Neo4j:
+    
+    ```bash
+    # Start Neo4j
+    neo4j start
+    
+    # Check status
+    neo4j status
+    ```
+    
+    Verify URI in `.env`: `bolt://localhost:7687`
+  </Accordion>
+
+  <Accordion title="Module import errors">
+    Ensure virtual environment is activated and dependencies are installed:
+    
+    ```bash
+    source venv/bin/activate
+    pip install -r requirements.txt
+    ```
+  </Accordion>
+
+  <Accordion title="CORS errors in browser">
+    Verify `FRONTEND_URL` is set correctly in backend `.env`:
+    
+    ```bash
+    FRONTEND_URL=http://localhost:3000
+    ```
+    
+    CORS middleware in `app/main.py` allows requests from this URL.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Deploy to Railway" icon="train" href="/deployment/railway">
+    Deploy the backend to production
+  </Card>
+  <Card title="Deploy to Vercel" icon="triangle" href="/deployment/vercel">
+    Deploy the frontend to production
+  </Card>
+</CardGroup>

@@ -1,0 +1,859 @@
+---
+title: Installation
+description: Complete setup guide for self-hosting Nectr AI PR Review Agent
+icon: download
+---
+
+This guide covers the complete installation process for self-hosting Nectr, including all required services, environment variables, and deployment configurations.
+
+<Note>
+Nectr is open-source and designed to be self-hosted. You maintain full control over your data, API keys, and infrastructure.
+</Note>
+
+---
+
+## Architecture Overview
+
+Before we begin, here's how Nectr components connect:
+
+```
+┌──────────┐     OAuth      ┌───────────────────────────────────┐
+│Developer │ ─────────────► │   FRONTEND (Vercel)               │
+│  Browser │ ◄───────────── │   Next.js 15 + React 19           │
+└──────────┘   JWT Cookie   └──────────────┬────────────────────┘
+                                           │ REST API
+                                           ▼
+┌────────────────────────────────────────────────────────────────┐
+│                    BACKEND (Railway)                           │
+│                    FastAPI + Uvicorn                           │
+│                                                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │  pr_review_  │  │  context_    │  │  ai_service  │        │
+│  │  service.py  │  │  service.py  │  │  (Claude)    │        │
+│  └──────────────┘  └──────────────┘  └──────────────┘        │
+└────────────────────────────────────────────────────────────────┘
+         │           │             │              │
+         ▼           ▼             ▼              ▼
+    ┌──────────┐ ┌─────────┐ ┌──────────┐  ┌──────────┐
+    │PostgreSQL│ │  Neo4j  │ │  Mem0    │  │Anthropic │
+    │(Railway) │ │  Graph  │ │ Memory   │  │  Claude  │
+    └──────────┘ └─────────┘ └──────────┘  └──────────┘
+```
+
+---
+
+## Prerequisites
+
+<Steps>
+  <Step title="GitHub Account">
+    You need a GitHub account with:
+    - Admin access to repositories you want to review
+    - Ability to create OAuth apps
+    - Ability to create personal access tokens
+  </Step>
+  
+  <Step title="Hosting Accounts">
+    Create accounts on:
+    - [Railway](https://railway.app) - Backend hosting
+    - [Vercel](https://vercel.com) - Frontend hosting
+  </Step>
+  
+  <Step title="Required Services">
+    Sign up for API access:
+    - [Anthropic Claude](https://console.anthropic.com) - AI model
+    - [Neo4j Aura](https://neo4j.com/cloud/platform/aura-graph-database/) - Knowledge graph
+    - [Mem0](https://mem0.ai) - Semantic memory
+    - [Supabase](https://supabase.com) - PostgreSQL database
+  </Step>
+</Steps>
+
+---
+
+## Part 1: Service Setup
+
+### 1.1 PostgreSQL Database (Supabase)
+
+<Steps>
+  <Step title="Create Project">
+    1. Go to [supabase.com](https://supabase.com) and create an account
+    2. Click **New Project**
+    3. Enter:
+       - **Name**: nectr-db
+       - **Database Password**: Generate a strong password
+       - **Region**: Choose closest to your users
+    4. Click **Create new project** (takes ~2 minutes)
+  </Step>
+  
+  <Step title="Get Connection String">
+    1. Go to **Project Settings** → **Database**
+    2. Scroll to **Connection Pooling**
+    3. Select **Session Mode** (port 5432)
+    4. Copy the connection string
+    5. Convert to async format:
+    
+    <CodeGroup>
+    ```bash Supabase Format
+    postgresql://postgres.<project-id>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+    ```
+    
+    ```bash Nectr Format (add +asyncpg)
+    postgresql+asyncpg://postgres.<project-id>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+    ```
+    </CodeGroup>
+  </Step>
+</Steps>
+
+<Warning>
+Use **Session Mode** connection pooling, not Transaction Mode. Nectr uses SQLAlchemy with async sessions that require Session Mode.
+</Warning>
+
+---
+
+### 1.2 Neo4j Knowledge Graph
+
+<Steps>
+  <Step title="Create Instance">
+    1. Go to [neo4j.com/cloud/aura](https://neo4j.com/cloud/platform/aura-graph-database/)
+    2. Click **Start Free**
+    3. Create an account or sign in
+    4. Click **Create Free Instance**
+    5. Select:
+       - **Instance Type**: AuraDB Free
+       - **Region**: Choose closest to your backend
+    6. Click **Create**
+  </Step>
+  
+  <Step title="Save Credentials">
+    **IMPORTANT**: A popup will show your credentials. Save them immediately:
+    
+    ```bash
+    NEO4J_URI=neo4j+s://xxxxx.databases.neo4j.io
+    NEO4J_USERNAME=neo4j
+    NEO4J_PASSWORD=xxxxxxxxxx
+    ```
+    
+    <Warning>
+    The password is only shown once. If you lose it, you'll need to reset it in the instance settings.
+    </Warning>
+  </Step>
+  
+  <Step title="Verify Connection">
+    1. Click **Open** on your instance
+    2. Use the credentials to connect via Neo4j Browser
+    3. Run a test query: `MATCH (n) RETURN count(n)`
+  </Step>
+</Steps>
+
+---
+
+### 1.3 Mem0 Semantic Memory
+
+<Steps>
+  <Step title="Create Account">
+    1. Go to [mem0.ai](https://mem0.ai)
+    2. Sign up for an account
+    3. Verify your email
+  </Step>
+  
+  <Step title="Generate API Key">
+    1. Navigate to **API Keys** in the dashboard
+    2. Click **Create New Key**
+    3. Copy the key (starts with `m0-`)
+    
+    ```bash
+    MEM0_API_KEY=m0-xxxxxxxxxx
+    ```
+  </Step>
+</Steps>
+
+---
+
+### 1.4 Anthropic Claude
+
+<Steps>
+  <Step title="Get API Key">
+    1. Go to [console.anthropic.com](https://console.anthropic.com)
+    2. Create an account or sign in
+    3. Navigate to **API Keys**
+    4. Click **Create Key**
+    5. Copy the key (starts with `sk-ant-`)
+    
+    ```bash
+    ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxx
+    ```
+  </Step>
+  
+  <Step title="Set Usage Limits (Optional)">
+    1. Go to **Settings** → **Billing**
+    2. Set a monthly budget to avoid unexpected charges
+    3. Enable email alerts
+    
+    <Tip>
+    Nectr uses Claude Sonnet 4.6. A typical PR review costs $0.03-$0.15 depending on PR size.
+    </Tip>
+  </Step>
+</Steps>
+
+---
+
+## Part 2: GitHub Configuration
+
+### 2.1 Create GitHub OAuth App
+
+<Steps>
+  <Step title="Register Application">
+    1. Go to [github.com/settings/developers](https://github.com/settings/developers)
+    2. Click **OAuth Apps** → **New OAuth App**
+    3. Fill in:
+       - **Application name**: `Nectr AI PR Review`
+       - **Homepage URL**: `https://your-app.vercel.app` (temporary, update later)
+       - **Application description**: `AI-powered PR review agent`
+       - **Authorization callback URL**: `https://your-app.up.railway.app/auth/github/callback` (temporary, update later)
+    4. Click **Register application**
+  </Step>
+  
+  <Step title="Save Credentials">
+    1. Copy the **Client ID**:
+    ```bash
+    GITHUB_CLIENT_ID=Iv1.xxxxxxxxxx
+    ```
+    
+    2. Click **Generate a new client secret**
+    3. Copy the secret immediately:
+    ```bash
+    GITHUB_CLIENT_SECRET=xxxxxxxxxx
+    ```
+    
+    <Warning>
+    The client secret is only shown once. Save it immediately or you'll need to regenerate it.
+    </Warning>
+  </Step>
+</Steps>
+
+---
+
+### 2.2 Create GitHub Personal Access Token
+
+<Steps>
+  <Step title="Generate Token">
+    1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
+    2. Click **Generate new token** → **Generate new token (classic)**
+    3. Configure:
+       - **Note**: `Nectr PR Review Bot`
+       - **Expiration**: `No expiration` (or set a reminder to rotate)
+       - **Scopes**: Select `repo` (full control of private repositories)
+    4. Click **Generate token**
+  </Step>
+  
+  <Step title="Save Token">
+    Copy the token immediately (starts with `ghp_`):
+    
+    ```bash
+    GITHUB_PAT=ghp_xxxxxxxxxx
+    ```
+    
+    <Note>
+    This token is used by Nectr to post PR review comments on your behalf. It's not stored in GitHub - only in your Railway environment.
+    </Note>
+  </Step>
+</Steps>
+
+---
+
+## Part 3: Backend Deployment (Railway)
+
+### 3.1 Deploy from GitHub
+
+<Steps>
+  <Step title="Fork Repository">
+    1. Go to the Nectr repository on GitHub
+    2. Click **Fork** in the top-right
+    3. Select your account
+  </Step>
+  
+  <Step title="Create Railway Project">
+    1. Go to [railway.app](https://railway.app)
+    2. Click **New Project**
+    3. Select **Deploy from GitHub repo**
+    4. Authenticate with GitHub
+    5. Select your forked Nectr repository
+    6. Click **Deploy Now**
+  </Step>
+</Steps>
+
+---
+
+### 3.2 Configure Environment Variables
+
+In Railway, go to your project → **Variables** and add the following:
+
+<Accordion title="Required Variables">
+
+```bash
+# ── AI ────────────────────────────────────────
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+
+# ── Database ──────────────────────────────────
+DATABASE_URL=postgresql+asyncpg://postgres.<project>:<pass>@aws-0-<region>.pooler.supabase.com:5432/postgres
+
+# ── GitHub OAuth ──────────────────────────────
+GITHUB_CLIENT_ID=Iv1.xxxxxxxxxx
+GITHUB_CLIENT_SECRET=xxxxxxxxxx
+GITHUB_PAT=ghp_xxxxxxxxxx
+
+# ── Auth ──────────────────────────────────────
+# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY=your-64-character-hex-secret
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=1440
+
+# ── Neo4j ─────────────────────────────────────
+NEO4J_URI=neo4j+s://xxxxx.databases.neo4j.io
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=xxxxxxxxxx
+
+# ── Mem0 ──────────────────────────────────────
+MEM0_API_KEY=m0-xxxxxxxxxx
+
+# ── URLs (update after first deploy) ─────────
+BACKEND_URL=https://nectr-production.up.railway.app
+FRONTEND_URL=https://nectr.vercel.app
+
+# ── App Config ────────────────────────────────
+APP_NAME=Nectr
+APP_ENV=production
+DEBUG=False
+LOG_LEVEL=INFO
+HOST=0.0.0.0
+PORT=8000
+```
+
+</Accordion>
+
+<Accordion title="Optional Variables (MCP Integrations)">
+
+```bash
+# ── Linear Integration ───────────────────────
+# Pulls linked issues and task descriptions into PR reviews
+LINEAR_MCP_URL=https://your-linear-mcp-server.com
+LINEAR_API_KEY=lin_api_xxxxxxxxxx
+
+# ── Sentry Integration ───────────────────────
+# Pulls production errors for files changed in the PR
+SENTRY_MCP_URL=https://your-sentry-mcp-server.com
+SENTRY_AUTH_TOKEN=xxxxxxxxxx
+
+# ── Slack Integration ────────────────────────
+# Pulls relevant channel messages as review context
+SLACK_MCP_URL=https://your-slack-mcp-server.com
+
+# ── Slack Bot (separate from MCP above) ──────
+# For direct Slack notifications
+SLACK_BOT_TOKEN=xoxb-xxxxxxxxxx
+SLACK_SIGNING_SECRET=xxxxxxxxxx
+
+# ── Feature Flags ────────────────────────────
+# Run 3 specialized agents in parallel (uses more tokens)
+PARALLEL_REVIEW_AGENTS=false
+
+# ── Webhook Secret (global fallback) ─────────
+# Per-repo secrets are auto-generated and stored in DB
+GITHUB_WEBHOOK_SECRET=xxxxxxxxxx
+```
+
+</Accordion>
+
+<Tip>
+Leave optional MCP variables blank to skip those integrations. Nectr will run fine without them.
+</Tip>
+
+---
+
+### 3.3 Get Backend URL
+
+<Steps>
+  <Step title="Wait for Deployment">
+    Railway will automatically deploy your backend. Wait for the build to complete (~2-3 minutes).
+  </Step>
+  
+  <Step title="Copy URL">
+    1. Go to your Railway project → **Settings**
+    2. Scroll to **Domains**
+    3. Click **Generate Domain**
+    4. Copy the URL (e.g., `nectr-production.up.railway.app`)
+  </Step>
+  
+  <Step title="Update Environment Variables">
+    1. Go back to **Variables**
+    2. Update `BACKEND_URL` to your Railway URL:
+    ```bash
+    BACKEND_URL=https://nectr-production.up.railway.app
+    ```
+    3. Railway will auto-redeploy
+  </Step>
+</Steps>
+
+---
+
+### 3.4 Update GitHub OAuth Callback
+
+<Steps>
+  <Step title="Update Callback URL">
+    1. Go to [github.com/settings/developers](https://github.com/settings/developers)
+    2. Click on your **Nectr AI PR Review** OAuth app
+    3. Update **Authorization callback URL** to:
+    ```
+    https://nectr-production.up.railway.app/auth/github/callback
+    ```
+    4. Click **Update application**
+  </Step>
+</Steps>
+
+---
+
+## Part 4: Frontend Deployment (Vercel)
+
+### 4.1 Deploy from GitHub
+
+<Steps>
+  <Step title="Import Project">
+    1. Go to [vercel.com](https://vercel.com)
+    2. Click **Add New** → **Project**
+    3. Import your forked Nectr repository
+  </Step>
+  
+  <Step title="Configure Build Settings">
+    1. **Framework Preset**: Next.js
+    2. **Root Directory**: `nectr-web`
+    3. **Build Command**: `npm run build` (auto-detected)
+    4. **Output Directory**: `.next` (auto-detected)
+  </Step>
+  
+  <Step title="Add Environment Variable">
+    In **Environment Variables**, add:
+    
+    ```bash
+    NEXT_PUBLIC_API_URL=https://nectr-production.up.railway.app
+    ```
+    
+    <Note>
+    Replace with your actual Railway backend URL from Part 3.
+    </Note>
+  </Step>
+  
+  <Step title="Deploy">
+    Click **Deploy**. Vercel will build and deploy your frontend (~2 minutes).
+  </Step>
+</Steps>
+
+---
+
+### 4.2 Get Frontend URL
+
+<Steps>
+  <Step title="Copy Vercel URL">
+    After deployment completes, copy your Vercel URL (e.g., `nectr.vercel.app`)
+  </Step>
+  
+  <Step title="Update Backend Environment">
+    1. Go back to Railway → **Variables**
+    2. Update `FRONTEND_URL`:
+    ```bash
+    FRONTEND_URL=https://nectr.vercel.app
+    ```
+    3. Railway will auto-redeploy
+  </Step>
+  
+  <Step title="Update GitHub OAuth Homepage">
+    1. Go to [github.com/settings/developers](https://github.com/settings/developers)
+    2. Click on your **Nectr AI PR Review** OAuth app
+    3. Update **Homepage URL** to your Vercel URL
+    4. Click **Update application**
+  </Step>
+</Steps>
+
+---
+
+## Part 5: Verification
+
+### 5.1 Test Backend Health
+
+<Steps>
+  <Step title="Check Health Endpoint">
+    Visit `https://your-backend.up.railway.app/health`
+    
+    You should see:
+    ```json
+    {
+      "status": "healthy",
+      "database": "connected",
+      "neo4j": "connected",
+      "uptime": 123.45
+    }
+    ```
+  </Step>
+  
+  <Step title="Check Logs">
+    In Railway:
+    1. Go to your project → **Deployments**
+    2. Click the latest deployment
+    3. Check logs for errors
+    
+    Look for:
+    ```
+    INFO:     Application startup complete.
+    INFO:     Uvicorn running on http://0.0.0.0:8000
+    ```
+  </Step>
+</Steps>
+
+---
+
+### 5.2 Test Frontend
+
+<Steps>
+  <Step title="Open Dashboard">
+    1. Navigate to your Vercel URL
+    2. You should see the Nectr landing page
+  </Step>
+  
+  <Step title="Test OAuth Login">
+    1. Click **Sign in with GitHub**
+    2. Authorize the OAuth app
+    3. You should be redirected to `/dashboard`
+  </Step>
+</Steps>
+
+---
+
+### 5.3 Connect First Repository
+
+<Steps>
+  <Step title="Navigate to Repos">
+    1. Click **Repos** in the sidebar
+    2. You should see a list of your GitHub repositories
+  </Step>
+  
+  <Step title="Install Webhook">
+    1. Find a test repository
+    2. Click **Connect** or **Install**
+    3. Wait for the installation to complete
+    
+    Behind the scenes, Nectr:
+    - Installs a webhook on the repo
+    - Scans all files and creates Neo4j nodes
+    - Indexes contributors and file ownership
+  </Step>
+  
+  <Step title="Test PR Review">
+    1. Create a test branch in your connected repo
+    2. Make a small change (add a comment, fix typo)
+    3. Open a pull request
+    4. Within 30 seconds, check the PR for a review comment from your GitHub account
+  </Step>
+</Steps>
+
+---
+
+## Part 6: Configuration
+
+### 6.1 Database Migrations
+
+Railway automatically runs database migrations on startup via `alembic`. If you need to run migrations manually:
+
+<CodeGroup>
+```bash Railway CLI
+railway run alembic upgrade head
+```
+
+```bash Local Development
+source venv/bin/activate
+alembic upgrade head
+```
+</CodeGroup>
+
+---
+
+### 6.2 Neo4j Schema Initialization
+
+Nectr automatically creates Neo4j constraints and indexes on first startup. To verify:
+
+<Steps>
+  <Step title="Open Neo4j Browser">
+    1. Go to your Neo4j instance in the Aura console
+    2. Click **Open** → Neo4j Browser
+    3. Enter your credentials
+  </Step>
+  
+  <Step title="Check Constraints">
+    Run:
+    ```cypher
+    SHOW CONSTRAINTS
+    ```
+    
+    You should see unique constraints on:
+    - `Repository.full_name`
+    - `File.path`
+    - `Developer.github_id`
+    - `PullRequest.pr_number`
+    - `Issue.number`
+  </Step>
+  
+  <Step title="Check Indexes">
+    Run:
+    ```cypher
+    SHOW INDEXES
+    ```
+    
+    You should see indexes on node labels and relationships.
+  </Step>
+</Steps>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Railway build fails">
+    **Common causes:**
+    
+    1. **Missing environment variables**: Check that all required variables are set
+    2. **Python version mismatch**: Nectr requires Python 3.14+. Check `runtime.txt` or Railway settings
+    3. **Dependency conflicts**: Check Railway logs for pip errors
+    
+    **Fix:**
+    ```bash
+    # Check Railway logs
+    railway logs
+    
+    # Redeploy
+    railway up --detach
+    ```
+  </Accordion>
+  
+  <Accordion title="Vercel build fails">
+    **Common causes:**
+    
+    1. **Wrong root directory**: Must be set to `nectr-web`
+    2. **Missing NEXT_PUBLIC_API_URL**: Required environment variable
+    3. **Node version mismatch**: Requires Node 20+
+    
+    **Fix:**
+    1. Go to Vercel project → **Settings** → **General**
+    2. Set **Root Directory** to `nectr-web`
+    3. Go to **Environment Variables**
+    4. Add `NEXT_PUBLIC_API_URL=https://your-backend.up.railway.app`
+    5. Redeploy from **Deployments** tab
+  </Accordion>
+  
+  <Accordion title="Database connection errors">
+    **Symptoms:**
+    ```
+    sqlalchemy.exc.OperationalError: could not connect to server
+    ```
+    
+    **Fix:**
+    1. Verify `DATABASE_URL` uses `postgresql+asyncpg://` prefix
+    2. Check Supabase connection pooling is enabled (Session Mode)
+    3. Test connection:
+    ```bash
+    railway run python -c "from app.core.database import engine; import asyncio; asyncio.run(engine.connect())"
+    ```
+  </Accordion>
+  
+  <Accordion title="Neo4j connection errors">
+    **Symptoms:**
+    ```
+    neo4j.exceptions.ServiceUnavailable: Unable to retrieve routing information
+    ```
+    
+    **Fix:**
+    1. Verify `NEO4J_URI` starts with `neo4j+s://` (not `bolt://`)
+    2. Check credentials in Neo4j Aura console
+    3. Test connection:
+    ```bash
+    railway run python -c "from app.core.neo4j_client import neo4j_client; import asyncio; asyncio.run(neo4j_client.verify())"
+    ```
+  </Accordion>
+  
+  <Accordion title="Webhook not triggering">
+    **Symptoms:**
+    - PR opened but no review posted
+    - No webhook events in Railway logs
+    
+    **Fix:**
+    1. Check webhook is installed:
+       - Go to GitHub repo → **Settings** → **Webhooks**
+       - Verify webhook URL matches `{BACKEND_URL}/api/v1/webhooks/github`
+    2. Test webhook delivery:
+       - Click on the webhook → **Recent Deliveries**
+       - Click **Redeliver** on a recent event
+    3. Check Railway logs for incoming requests:
+    ```bash
+    railway logs --filter "POST /api/v1/webhooks/github"
+    ```
+  </Accordion>
+  
+  <Accordion title="OAuth login fails">
+    **Symptoms:**
+    - Redirects to GitHub but never returns
+    - "Invalid client" error
+    
+    **Fix:**
+    1. Verify GitHub OAuth app callback URL:
+    ```
+    https://your-backend.up.railway.app/auth/github/callback
+    ```
+    2. Check `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in Railway
+    3. Verify `FRONTEND_URL` matches your Vercel domain
+    4. Check CORS configuration in `app/main.py`:
+    ```python
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.FRONTEND_URL],
+        allow_credentials=True,
+    )
+    ```
+  </Accordion>
+  
+  <Accordion title="Review posted but empty/incomplete">
+    **Symptoms:**
+    - Review comment appears but has no content
+    - Review is cut off mid-sentence
+    
+    **Fix:**
+    1. Check `ANTHROPIC_API_KEY` is valid
+    2. Verify API key has sufficient credits
+    3. Check Railway logs for Anthropic API errors:
+    ```bash
+    railway logs --filter "anthropic"
+    ```
+    4. Increase timeout if reviews are large:
+    ```python
+    # app/services/ai_service.py
+    client = anthropic.AsyncAnthropic(
+        api_key=settings.ANTHROPIC_API_KEY,
+        timeout=120.0  # Increase from default 60s
+    )
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+    Get your first PR reviewed in under 10 minutes
+  </Card>
+  
+  <Card title="MCP Integrations" icon="link" href="/integrations/mcp-overview">
+    Connect Linear, Sentry, and Slack for richer context
+  </Card>
+  
+  <Card title="Memory Configuration" icon="brain" href="/features/semantic-memory">
+    Customize project patterns and coding rules
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api/auth/github-oauth">
+    Explore all backend endpoints and webhooks
+  </Card>
+</CardGroup>
+
+---
+
+## Local Development
+
+To run Nectr locally for development:
+
+<Steps>
+  <Step title="Clone Repository">
+    ```bash
+    git clone https://github.com/your-username/nectr.git
+    cd nectr
+    ```
+  </Step>
+  
+  <Step title="Set Up Backend">
+    ```bash
+    # Create virtual environment
+    python3 -m venv venv
+    source venv/bin/activate
+    
+    # Install dependencies
+    pip install -r requirements.txt
+    
+    # Copy environment file
+    cp .env.example .env
+    # Edit .env and fill in required values
+    
+    # Run migrations
+    alembic upgrade head
+    
+    # Start server
+    uvicorn app.main:app --reload --port 8000
+    ```
+  </Step>
+  
+  <Step title="Set Up Frontend">
+    ```bash
+    cd nectr-web
+    
+    # Install dependencies
+    npm install
+    
+    # Copy environment file
+    cp .env.example .env.local
+    # Edit .env.local and set NEXT_PUBLIC_API_URL=http://localhost:8000
+    
+    # Start dev server
+    npm run dev
+    ```
+    
+    Frontend runs on `http://localhost:3001` (configured in `package.json`).
+  </Step>
+  
+  <Step title="Configure Tunnels (Optional)">
+    To test webhooks locally, use ngrok:
+    
+    ```bash
+    # Install ngrok
+    brew install ngrok
+    
+    # Start tunnel
+    ngrok http 8000
+    
+    # Copy HTTPS URL and use as BACKEND_URL in .env
+    # Update GitHub webhook URL to point to ngrok URL
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Production Checklist
+
+Before going to production, verify:
+
+- [ ] All environment variables are set in Railway and Vercel
+- [ ] `SECRET_KEY` is a cryptographically secure random value (not the default)
+- [ ] `BACKEND_URL` and `FRONTEND_URL` match your actual domains
+- [ ] GitHub OAuth callback URL points to Railway backend
+- [ ] `DATABASE_URL` uses connection pooling (Session Mode)
+- [ ] Neo4j instance is running and accessible
+- [ ] Mem0 API key is valid and has quota
+- [ ] Anthropic API key has sufficient credits
+- [ ] `GITHUB_PAT` has `repo` scope and doesn't expire soon
+- [ ] Railway auto-deploys from `main` branch
+- [ ] Vercel auto-deploys from `main` branch
+- [ ] Health endpoint returns `{"status": "healthy"}`
+- [ ] Test PR review completes successfully
+- [ ] MCP integrations are configured (or intentionally disabled)
+- [ ] Logging level is set to `INFO` or `WARNING` (not `DEBUG`)
+- [ ] CORS origins are restricted to your frontend domain
+
+<Tip>
+Set up monitoring with Railway's built-in metrics and Vercel Analytics to track performance and errors.
+</Tip>

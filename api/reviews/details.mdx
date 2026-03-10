@@ -1,0 +1,223 @@
+---
+title: 'Get Review Details'
+api: 'GET /api/v1/reviews/{review_id}'
+description: 'Retrieve detailed information about a specific PR review'
+---
+
+## Overview
+
+Fetch complete details for a single PR review by its event ID, including the full AI-generated summary and all analyzed files.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+## Path Parameters
+
+<ParamField path="review_id" type="integer" required>
+  The unique event ID of the review
+</ParamField>
+
+## Response
+
+Returns a single review object with full details.
+
+<ResponseField name="id" type="integer">
+  Event ID
+</ResponseField>
+
+<ResponseField name="event_type" type="string">
+  Type of event (e.g., "pull_request")
+</ResponseField>
+
+<ResponseField name="source" type="string">
+  Event source (e.g., "github")
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Processing status: `pending`, `processing`, `completed`, or `failed`
+</ResponseField>
+
+<ResponseField name="pr_status" type="string">
+  Current PR status: `open`, `merged`, or `closed`
+</ResponseField>
+
+<ResponseField name="created_at" type="datetime">
+  Timestamp when the event was created
+</ResponseField>
+
+<ResponseField name="processed_at" type="datetime">
+  Timestamp when the event was processed (null if pending)
+</ResponseField>
+
+<ResponseField name="pr_title" type="string">
+  Pull request title
+</ResponseField>
+
+<ResponseField name="pr_number" type="integer">
+  Pull request number
+</ResponseField>
+
+<ResponseField name="repo_name" type="string">
+  Repository full name (owner/repo)
+</ResponseField>
+
+<ResponseField name="branch" type="string">
+  Source branch name
+</ResponseField>
+
+<ResponseField name="author" type="string">
+  GitHub username of the PR author
+</ResponseField>
+
+<ResponseField name="pr_url" type="string">
+  Direct URL to the pull request on GitHub
+</ResponseField>
+
+<ResponseField name="ai_summary" type="string">
+  Complete AI-generated review summary including verdict, confidence score, and detailed findings
+</ResponseField>
+
+<ResponseField name="files_analyzed" type="integer">
+  Total number of files analyzed by the AI reviewer
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X GET "https://api.nectr.ai/api/v1/reviews/1234" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import requests
+
+review_id = 1234
+response = requests.get(
+    f"https://api.nectr.ai/api/v1/reviews/{review_id}",
+    headers={"Authorization": f"Bearer {token}"}
+)
+
+review = response.json()
+print(f"Review status: {review['status']}")
+print(f"AI Summary:\n{review['ai_summary']}")
+```
+
+```javascript JavaScript
+const reviewId = 1234;
+const response = await fetch(
+  `https://api.nectr.ai/api/v1/reviews/${reviewId}`,
+  {
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  }
+);
+
+const review = await response.json();
+console.log('AI Summary:', review.ai_summary);
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "id": 1234,
+  "event_type": "pull_request",
+  "source": "github",
+  "status": "completed",
+  "pr_status": "open",
+  "created_at": "2026-03-10T14:30:00Z",
+  "processed_at": "2026-03-10T14:32:15Z",
+  "pr_title": "Add user authentication endpoints",
+  "pr_number": 42,
+  "repo_name": "acme/api-server",
+  "branch": "feature/auth",
+  "author": "johndoe",
+  "pr_url": "https://github.com/acme/api-server/pull/42",
+  "ai_summary": "APPROVE\n\nConfidence: 4/5\n\nThis PR implements secure user authentication endpoints with JWT token generation and validation. The implementation follows security best practices and includes comprehensive error handling.\n\n🟢 **Minor Suggestion**: Consider rate-limiting authentication attempts\n\n### Security\n- Password hashing uses bcrypt with appropriate cost factor\n- JWT tokens include expiration and refresh mechanism\n- Input validation prevents injection attacks\n\n### Code Quality\n- Clean separation of concerns\n- Comprehensive unit tests included\n- API documentation is thorough\n\n### Recommendation\nThis PR is ready to merge. The authentication implementation is solid and follows industry standards.",
+  "files_analyzed": 8
+}
+```
+
+## Error Responses
+
+### Review Not Found
+
+```json
+{
+  "detail": "Review not found"
+}
+```
+
+HTTP Status: `404 Not Found`
+
+### Unauthorized
+
+```json
+{
+  "detail": "Not authenticated"
+}
+```
+
+HTTP Status: `401 Unauthorized`
+
+## AI Summary Format
+
+The `ai_summary` field contains a structured review with the following elements:
+
+1. **Verdict**: One of `APPROVE`, `REQUEST_CHANGES`, or `NEEDS_DISCUSSION`
+2. **Confidence Score**: Rated from 1/5 to 5/5
+3. **Categorized Issues**: Grouped by severity with emoji indicators:
+   - 🔴 **Critical**: Security vulnerabilities, breaking changes, data loss risks
+   - 🟡 **Moderate**: Performance issues, code quality concerns, missing tests
+   - 🟢 **Minor**: Style suggestions, documentation improvements, refactoring opportunities
+4. **Detailed Analysis**: Context-aware insights based on the codebase and PR changes
+5. **Recommendation**: Final verdict on whether the PR should be merged
+
+## Use Cases
+
+### Display Full Review in UI
+
+```python
+review = get_review(review_id)
+
+if review['status'] == 'completed':
+    print(f"PR #{review['pr_number']}: {review['pr_title']}")
+    print(f"Files analyzed: {review['files_analyzed']}")
+    print("\nAI Review:")
+    print(review['ai_summary'])
+else:
+    print(f"Review status: {review['status']}")
+```
+
+### Extract Verdict and Confidence
+
+```python
+import re
+
+review = get_review(review_id)
+summary = review['ai_summary']
+
+# Extract verdict
+if 'APPROVE' in summary:
+    verdict = 'APPROVE'
+elif 'REQUEST_CHANGES' in summary:
+    verdict = 'REQUEST_CHANGES'
+elif 'NEEDS_DISCUSSION' in summary:
+    verdict = 'NEEDS_DISCUSSION'
+
+# Extract confidence score
+match = re.search(r'Confidence: (\d)/5', summary)
+confidence = int(match.group(1)) if match else None
+
+print(f"Verdict: {verdict} (Confidence: {confidence}/5)")
+```

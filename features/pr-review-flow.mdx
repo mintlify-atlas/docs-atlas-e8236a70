@@ -1,0 +1,414 @@
+---
+title: 'PR Review Flow'
+description: 'End-to-end workflow from GitHub webhook to posted review'
+icon: 'code-pull-request'
+---
+
+## Overview
+
+Nectr automatically reviews every pull request using an AI-powered workflow that combines diff analysis, contextual intelligence from Neo4j and Mem0, and optional MCP integrations. When a PR is opened or updated, GitHub sends a webhook that triggers the review pipeline.
+
+<Info>
+The entire review process runs asynchronously in the background, returning an HTTP 200 immediately to avoid webhook timeouts.
+</Info>
+
+## Architecture Diagram
+
+```
+  Developer opens / updates a Pull Request on GitHub
+           │
+           ▼
+  GitHub → POST /api/v1/webhooks/github
+           │
+           ├─ Verify HMAC-SHA256 signature
+           ├─ Deduplicate (ignore duplicate events within 1hr)
+           ├─ Create Event row (status = pending)
+           └─ Return HTTP 200 immediately
+                    │
+                    ▼
+  BackgroundTask: process_pr_in_background()
+           │
+           ├─ 1. Fetch PR data from GitHub
+           │      get_pr_diff()  get_pr_files()  get_file_content()
+           │
+           ├─ 2. Pull MCP context (if configured)
+           │      ├─ Linear: linked issues & task descriptions
+           │      ├─ Sentry: related errors for changed files
+           │      └─ Slack: relevant channel messages
+           │
+           ├─ 3. Build ReviewContext (parallel)
+           │      ├─ Mem0: project patterns, decisions, rules
+           │      ├─ Mem0: developer-specific patterns & strengths
+           │      ├─ Neo4j: file experts (who touched these files most)
+           │      └─ Neo4j: related past PRs with file overlap
+           │
+           ├─ 4. AI Analysis — two modes (set PARALLEL_REVIEW_AGENTS)
+           │
+           │      STANDARD (default)               PARALLEL (opt-in)
+           │      ──────────────────               ────────────────────
+           │      Single agentic loop              asyncio.gather() runs:
+           │      with 8 MCP-style tools           ├─ Security agent
+           │      (search code, fetch              ├─ Performance agent
+           │       issues, get errors…)            └─ Style agent
+           │                                        ▼
+           │                                  Synthesis agent combines
+           │                                  all three into final review
+           │
+           ├─ 5. Post Review on GitHub PR
+           │      • Posts as your GitHub account (PAT)
+           │      • Inline review comments + top-level summary
+           │
+           ├─ 6. Index PR in Neo4j Graph
+           │      Creates: PullRequest + Developer nodes
+           │      Edges:   TOUCHES → Files
+           │               AUTHORED_BY → Developer
+           │               CLOSES → Issues
+           │
+           ├─ 7. Extract & Store Memories in Mem0
+           │      Claude extracts: project_pattern, decision,
+           │      developer_pattern, developer_strength, risk_module,
+           │      contributor_profile
+           │
+           └─ 8. Update Event status → completed / failed
+```
+
+## Workflow Stages
+
+<Steps>
+
+### Webhook Reception & Verification
+
+When GitHub sends a webhook, Nectr validates the HMAC-SHA256 signature using the webhook secret to ensure authenticity. The event is deduplicated (ignoring duplicate events within 1 hour) and stored in PostgreSQL with status `pending`.
+
+```python
+# app/api/v1/webhooks.py
+@router.post("/github")
+async def handle_github_webhook(request: Request, db: AsyncSession):
+    # Verify HMAC-SHA256 signature
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not verify_signature(payload, signature, webhook_secret):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    
+    # Deduplicate within 1 hour
+    existing = await check_duplicate_event(db, delivery_id, within_hours=1)
+    if existing:
+        return {"status": "duplicate", "event_id": existing.id}
+    
+    # Create Event record
+    event = Event(delivery_id=delivery_id, status="pending")
+    db.add(event)
+    await db.commit()
+    
+    # Process in background
+    background_tasks.add_task(process_pr_in_background, payload, event.id)
+    return {"status": "accepted", "event_id": event.id}
+```
+
+### GitHub Data Fetching
+
+Nectr fetches the PR diff, changed files list, and (for agentic mode) lazily fetches full file contents as Claude requests them via tools.
+
+```python
+# app/services/pr_review_service.py:496-499
+diff = await github_client.get_pr_diff(owner, repo, pr_number, token=github_token)
+files = await github_client.get_pr_files(owner, repo, pr_number, token=github_token)
+file_paths = [f.get("filename", "") for f in files if f.get("filename")]
+author = (pr.get("user") or {}).get("login", "")
+```
+
+### Context Building (Parallel)
+
+Nectr queries four context sources concurrently:
+
+1. **Linked Issues**: Parses `Fixes #N`, `Closes #N` from PR body/title and fetches issue details from GitHub
+2. **Open PR Conflicts**: Finds other open PRs that touch the same files
+3. **Semantic Issue Candidates**: Keyword-based pre-filter of open issues (Claude does final semantic match)
+4. **Related Past PRs**: Queries Neo4j for past PRs that modified overlapping files
+
+```python
+# app/services/pr_review_service.py:512-523
+issue_details, open_pr_conflicts, candidate_issues, related_prs = await asyncio.gather(
+    _fetch_issue_details(owner, repo, issue_refs),
+    _get_open_pr_conflicts(owner, repo, pr_number, file_paths),
+    _find_candidate_issues(
+        owner, repo,
+        pr_title, pr_body,
+        file_paths,
+        already_referenced=set(issue_refs),
+    ),
+    graph_builder.get_related_prs(repo_full_name, file_paths[:10], top_k=5),
+    return_exceptions=True,
+)
+```
+
+### AI Analysis (Two Modes)
+
+#### Standard Mode (Default)
+
+Claude runs a single agentic loop with 8 MCP-style tools. It fetches context **on-demand** instead of receiving everything upfront.
+
+**Available Tools**:
+- `read_file`: Read full source code at HEAD commit
+- `search_project_memory`: Query Mem0 for project patterns
+- `search_developer_memory`: Query Mem0 for developer patterns
+- `get_file_history`: Get file experts + related PRs from Neo4j
+- `get_issue_details`: Fetch GitHub issue details
+- `search_open_issues`: Keyword search in open issues
+- `get_linked_issues`: Query Linear/GitHub via MCP
+- `get_related_errors`: Query Sentry via MCP
+
+```python
+# app/services/pr_review_service.py:566-569
+review_result = await ai_service.analyze_pull_request_agentic(
+    pr, diff, files, tool_executor, issue_refs=issue_refs
+)
+```
+
+**Example tool call flow** (from `ai_service.py:636-697`):
+
+```python
+for round_num in range(max_rounds):
+    response = await self.client.messages.create(
+        model=self.model,
+        max_tokens=4000,
+        tools=REVIEW_TOOLS,
+        messages=messages,
+    )
+    
+    if response.stop_reason == "tool_use":
+        for block in response.content:
+            if block.type == "tool_use":
+                result = await tool_executor.execute(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+        messages.append({"role": "user", "content": tool_results})
+```
+
+#### Parallel Mode (Opt-in)
+
+Three specialized agents run concurrently, then a synthesis agent combines their findings.
+
+```python
+# app/services/pr_review_service.py:560-564
+use_parallel = getattr(settings, 'PARALLEL_REVIEW_AGENTS', False)
+if use_parallel:
+    review_result = await ai_service.analyze_pull_request_parallel(
+        pr, diff, files, tool_executor, issue_refs=issue_refs
+    )
+```
+
+**Agents**:
+- **Security Agent**: Injection vulns, auth flaws, secrets, crypto issues
+- **Performance Agent**: N+1 queries, unbounded loops, memory leaks, blocking I/O
+- **Style Agent**: Missing tests, complex functions, unclear naming, dead code
+
+```python
+# app/services/ai_service.py:770-773
+security_out, performance_out, style_out = await asyncio.gather(
+    security_task, performance_task, style_task,
+    return_exceptions=True
+)
+```
+
+The synthesis agent then merges findings into a unified verdict:
+
+```python
+# app/services/ai_service.py:787-795
+return await self._synthesize_review(
+    pr=pr,
+    diff=diff,
+    files=files,
+    security_findings=security_findings,
+    performance_findings=performance_findings,
+    style_findings=style_findings,
+    issue_refs=issue_refs,
+)
+```
+
+### Review Posting
+
+Nectr posts the review to GitHub using the GitHub REST API with your personal access token. It attempts to post as a GitHub review (with inline suggestions), falling back to a flat issue comment if HEAD SHA is unavailable.
+
+```python
+# app/services/pr_review_service.py:716-725
+try:
+    await github_client.post_pr_review(
+        owner, repo, pr_number,
+        commit_id=head_sha,
+        body=comment_body,
+        event=github_event,  # "APPROVE" | "REQUEST_CHANGES" | "COMMENT"
+        comments=inline_comments,
+        token=github_token,
+    )
+except Exception as review_err:
+    # Fallback to flat comment if review fails
+    await github_client.post_pr_comment(owner, repo, pr_number, comment_body, token=github_token)
+```
+
+**Review includes**:
+- Summary with verdict (APPROVE / REQUEST_CHANGES / NEEDS_DISCUSSION)
+- Resolved issues section (explicit `Fixes #N`)
+- Semantic issue matches (issues resolved without explicit mention)
+- Open PR conflicts warning
+- Related past work from Neo4j
+- Inline suggestion comments (GitHub suggested-change format)
+
+### Neo4j Graph Indexing
+
+After posting the review, Nectr indexes the PR in Neo4j to build the knowledge graph.
+
+```python
+# app/services/pr_review_service.py:771-779
+await graph_builder.index_pr(
+    repo_full_name=repo_full_name,
+    pr_number=pr_number,
+    title=pr_title,
+    author=author,
+    files_changed=file_paths,
+    verdict=review_result.verdict,
+    issue_numbers=all_issue_numbers,
+)
+```
+
+This creates:
+- **PullRequest** node with title, author, verdict, reviewed_at
+- **Developer** node (if not exists) with login
+- **AUTHORED_BY** edge from PR to Developer
+- **TOUCHES** edges from PR to each changed File
+- **CLOSES** edges from PR to each Issue
+- **CONTRIBUTED_TO** edge from Developer to Repository
+
+### Memory Extraction
+
+Claude extracts structured memories from the completed review and stores them in Mem0 for future context.
+
+```python
+# app/services/pr_review_service.py:782-789
+await extract_and_store(
+    repo_full_name=repo_full_name,
+    pr_number=pr_number,
+    author=author,
+    title=pr_title,
+    files=files,
+    review_summary=summary,
+)
+```
+
+**Memory types extracted** (from `memory_extractor.py:17-24`):
+- `project_pattern`: Architectural patterns confirmed
+- `decision`: Approaches approved/rejected (includes PR#)
+- `developer_pattern`: Recurring issues for this developer
+- `developer_strength`: Things this developer does well
+- `risk_module`: Fragile or security-critical files
+- `contributor_profile`: Aggregated profile (topics, files, feedback, strengths)
+
+### Workflow Completion
+
+The workflow updates the Event and WorkflowRun status to `completed` or `failed` with full result metadata.
+
+```python
+# app/services/pr_review_service.py:745-756
+workflow.status = "completed"
+workflow.result = json.dumps({
+    "ai_summary": summary,
+    "files_analyzed": len(files),
+    "comment_posted": True,
+    "verdict": review_result.verdict,
+    "inline_suggestions": len(inline_comments),
+    "linked_issues": [i["number"] for i in linked_issues],
+    "related_prs": len(related_prs),
+    "open_pr_conflicts": len(open_pr_conflicts),
+    "semantic_issue_matches": [m["number"] for m in review_result.semantic_issue_matches],
+})
+```
+
+</Steps>
+
+## Configuration
+
+### Standard vs Parallel Mode
+
+Set the `PARALLEL_REVIEW_AGENTS` environment variable to enable parallel specialized agents:
+
+```bash
+# Standard mode (default) — single agentic loop
+PARALLEL_REVIEW_AGENTS=false
+
+# Parallel mode — 3 specialized agents + synthesis
+PARALLEL_REVIEW_AGENTS=true
+```
+
+**When to use parallel mode**:
+- Larger PRs (>500 lines) where specialized analysis helps
+- Security-critical repos that need thorough security review
+- High-traffic repos where you want faster turnaround (parallel = faster)
+
+**When to use standard mode**:
+- Small to medium PRs (&lt;500 lines)
+- Repos where context depth matters more than speed
+- When you want Claude to follow its own reasoning thread
+
+### MCP Integration (Optional)
+
+Set these environment variables to enable MCP context sources:
+
+```bash
+# Linear integration
+LINEAR_MCP_URL=https://linear-mcp.example.com
+LINEAR_API_KEY=lin_api_...
+
+# Sentry integration
+SENTRY_MCP_URL=https://sentry-mcp.example.com
+SENTRY_AUTH_TOKEN=...
+
+# Slack integration
+SLACK_MCP_URL=https://slack-mcp.example.com
+```
+
+If not set, Nectr silently skips that integration — reviews still work without them.
+
+## Performance
+
+<CardGroup cols={2}>
+
+<Card title="Average Review Time" icon="clock">
+  **Standard mode**: 15-30 seconds
+  
+  **Parallel mode**: 10-20 seconds
+</Card>
+
+<Card title="Context Sources" icon="database">
+  **GitHub**: PR diff, files, issues
+  
+  **Neo4j**: File experts, related PRs
+  
+  **Mem0**: Project patterns, developer habits
+  
+  **MCP**: Linear, Sentry, Slack (optional)
+</Card>
+
+</CardGroup>
+
+## Error Handling
+
+Nectr handles failures gracefully at every stage:
+
+- **GitHub API errors**: Logged, workflow marked as failed, no review posted
+- **Neo4j unavailable**: Silently skips graph queries, continues with Mem0 context
+- **Mem0 unavailable**: Silently skips memory queries, continues with Neo4j context
+- **MCP integration errors**: Logged, continues without that integration's data
+- **Review posting failure**: Attempts GitHub review first, falls back to flat comment
+
+<Warning>
+If the PR review fails completely, check the `/api/v1/events` endpoint to see the error details stored in the Event record.
+</Warning>
+
+## Related Files
+
+- `app/services/pr_review_service.py` — Main orchestrator ([view source](app/services/pr_review_service.py))
+- `app/services/ai_service.py` — Claude integration + parallel agents ([view source](app/services/ai_service.py))
+- `app/integrations/github/client.py` — GitHub REST API client ([view source](app/integrations/github/client.py))
+- `app/api/v1/webhooks.py` — Webhook receiver ([view source](app/api/v1/webhooks.py))

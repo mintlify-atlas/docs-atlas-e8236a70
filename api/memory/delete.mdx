@@ -1,0 +1,282 @@
+---
+title: 'Delete Memory'
+api: 'DELETE /api/v1/memory/{memory_id}'
+description: 'Remove a specific AI memory from a repository'
+---
+
+## Overview
+
+Delete a memory by its unique ID. This is useful for removing outdated rules, incorrect information, or memories that are no longer relevant to your project.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+## Path Parameters
+
+<ParamField path="memory_id" type="string" required>
+  Unique ID of the memory to delete
+</ParamField>
+
+## Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository in `owner/repo` format (e.g., "acme/api-server")
+</ParamField>
+
+## Response
+
+<ResponseField name="status" type="string">
+  Status of the operation ("deleted")
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X DELETE "https://api.nectr.ai/api/v1/memory/mem_a1b2c3d4e5?repo=acme/api-server" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import requests
+
+memory_id = "mem_a1b2c3d4e5"
+response = requests.delete(
+    f"https://api.nectr.ai/api/v1/memory/{memory_id}",
+    headers={"Authorization": f"Bearer {token}"},
+    params={"repo": "acme/api-server"}
+)
+
+result = response.json()
+print(f"Status: {result['status']}")
+```
+
+```javascript JavaScript
+const memoryId = 'mem_a1b2c3d4e5';
+const response = await fetch(
+  `https://api.nectr.ai/api/v1/memory/${memoryId}?repo=acme/api-server`,
+  {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  }
+);
+
+const result = await response.json();
+console.log(`Status: ${result.status}`);
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "status": "deleted"
+}
+```
+
+## Error Responses
+
+### Memory Not Found
+
+```json
+{
+  "detail": "Memory not found or already deleted"
+}
+```
+
+HTTP Status: `404 Not Found`
+
+### Repository Not Connected
+
+```json
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+HTTP Status: `403 Forbidden`
+
+## Use Cases
+
+### Remove Outdated Rule
+
+```python
+# First, find the memory to delete
+memories = list_memories(repo="acme/api-server", memory_type="project_rule")
+
+for memory in memories['memories']:
+    if "deprecated" in memory['memory'].lower():
+        delete_memory(
+            memory_id=memory['id'],
+            repo="acme/api-server"
+        )
+        print(f"🗑️ Deleted outdated rule: {memory['memory'][:60]}...")
+```
+
+### Bulk Delete by Pattern
+
+```python
+import re
+
+def delete_memories_matching(repo, pattern, memory_type=None):
+    """Delete all memories matching a regex pattern."""
+    memories = list_memories(repo=repo, memory_type=memory_type)
+    deleted_count = 0
+    
+    for memory in memories['memories']:
+        if re.search(pattern, memory['memory'], re.IGNORECASE):
+            try:
+                delete_memory(memory_id=memory['id'], repo=repo)
+                deleted_count += 1
+                print(f"✅ Deleted: {memory['memory'][:60]}...")
+            except Exception as e:
+                print(f"❌ Failed to delete {memory['id']}: {e}")
+    
+    return deleted_count
+
+# Delete all memories mentioning old framework
+count = delete_memories_matching(
+    repo="acme/api-server",
+    pattern=r"Flask|Pyramid",  # Migrated to FastAPI
+    memory_type="project_rule"
+)
+print(f"\nDeleted {count} outdated memories")
+```
+
+### Clean Up Developer Memories
+
+```python
+def cleanup_former_contributor(repo, username):
+    """Remove all memories for a developer who left the team."""
+    memories = list_memories(repo=repo)
+    deleted = 0
+    
+    for memory in memories['memories']:
+        metadata = memory.get('metadata', {})
+        if metadata.get('username') == username:
+            delete_memory(memory_id=memory['id'], repo=repo)
+            deleted += 1
+    
+    print(f"Removed {deleted} memories for {username}")
+
+cleanup_former_contributor("acme/api-server", "former-employee")
+```
+
+### Interactive Memory Management
+
+```python
+def review_and_cleanup_memories(repo, memory_type="project_rule"):
+    """Interactively review and delete memories."""
+    memories = list_memories(repo=repo, memory_type=memory_type)
+    
+    print(f"Found {memories['count']} {memory_type} memories\n")
+    
+    for i, memory in enumerate(memories['memories'], 1):
+        print(f"\n[{i}/{memories['count']}]")
+        print(f"ID: {memory['id']}")
+        print(f"Content: {memory['memory']}")
+        
+        metadata = memory.get('metadata', {})
+        if 'source_pr' in metadata:
+            print(f"Source: PR #{metadata['source_pr']}")
+        
+        action = input("\nKeep this memory? [y/n/q(uit)]: ").lower()
+        
+        if action == 'q':
+            break
+        elif action == 'n':
+            delete_memory(memory_id=memory['id'], repo=repo)
+            print("✅ Deleted")
+        else:
+            print("✅ Kept")
+
+review_and_cleanup_memories("acme/api-server")
+```
+
+### Remove Duplicate Memories
+
+```python
+from collections import defaultdict
+
+def remove_duplicate_memories(repo, memory_type="project_rule"):
+    """Keep only the first occurrence of duplicate memory content."""
+    memories = list_memories(repo=repo, memory_type=memory_type)
+    
+    seen = defaultdict(list)
+    for memory in memories['memories']:
+        content = memory['memory'].strip().lower()
+        seen[content].append(memory)
+    
+    deleted = 0
+    for content, duplicates in seen.items():
+        if len(duplicates) > 1:
+            print(f"\nFound {len(duplicates)} duplicates of: {content[:60]}...")
+            # Keep the first, delete the rest
+            for duplicate in duplicates[1:]:
+                delete_memory(memory_id=duplicate['id'], repo=repo)
+                deleted += 1
+                print(f"  🗑️ Deleted duplicate: {duplicate['id']}")
+    
+    print(f"\n✅ Removed {deleted} duplicate memories")
+
+remove_duplicate_memories("acme/api-server")
+```
+
+### Conditional Cleanup After Project Migration
+
+```python
+def cleanup_after_migration(repo, old_patterns, new_memories):
+    """
+    Clean up old memories and add new ones after a technology migration.
+    
+    Args:
+        repo: Repository name
+        old_patterns: List of regex patterns to match old memories
+        new_memories: List of new memory content to add
+    """
+    # Delete old memories
+    deleted_count = 0
+    for pattern in old_patterns:
+        count = delete_memories_matching(repo, pattern)
+        deleted_count += count
+    
+    print(f"\n✅ Deleted {deleted_count} old memories")
+    
+    # Add new memories
+    print("\nAdding new memories...")
+    for content in new_memories:
+        create_memory(repo=repo, content=content, memory_type="project_rule")
+        print(f"✅ Added: {content[:60]}...")
+
+# Example: Migrated from REST to GraphQL
+cleanup_after_migration(
+    repo="acme/api-server",
+    old_patterns=[
+        r"REST.*endpoint",
+        r"@router\.(get|post|put|delete)",
+        r"return Response\("
+    ],
+    new_memories=[
+        "All API queries and mutations must be defined in schema.graphql with proper type definitions.",
+        "GraphQL resolvers must implement proper error handling and return structured errors.",
+        "Use DataLoader for batching and caching to prevent N+1 query problems."
+    ]
+)
+```
+
+## Notes
+
+- Deletion is **permanent** and cannot be undone
+- You must have the repository connected to your account to delete memories
+- Deleting a memory will immediately affect future code reviews
+- If a memory was auto-learned from PR analysis, it may be recreated if similar patterns appear in future PRs
+- The `repo` query parameter is required for access control validation

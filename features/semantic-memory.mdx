@@ -1,0 +1,581 @@
+---
+title: 'Semantic Memory'
+description: 'Mem0-powered memory system for project patterns and developer context'
+icon: 'brain'
+---
+
+## Overview
+
+Nectr uses **Mem0** to remember project patterns, architectural decisions, and developer-specific habits across PRs. Unlike the Neo4j knowledge graph (which tracks structural relationships), Mem0 stores **semantic memories** — natural language insights that Claude extracts after each review.
+
+Every time Nectr reviews a PR, it:
+1. Searches Mem0 for relevant memories to include as context
+2. Extracts new learnings from the completed review and stores them for future PRs
+
+<Info>
+Mem0 memories are scoped by `project_id=repo` and `user_id=developer`. This means each repo has its own context, and each developer has a personal profile within that repo.
+</Info>
+
+## Memory Types
+
+Nectr extracts six types of memories (defined in `memory_extractor.py:17-24`):
+
+<CardGroup cols={2}>
+
+<Card title="project_pattern" icon="diagram-project">
+  **Architectural patterns confirmed by this PR**
+  
+  Example: "This repo uses dependency injection via FastAPI Depends for database sessions"
+</Card>
+
+<Card title="decision" icon="gavel">
+  **Approaches approved or rejected**
+  
+  Example: "PR #42: Rejected eager-loading users with all posts due to N+1 risk; approved lazy loading"
+</Card>
+
+<Card title="developer_pattern" icon="user-xmark">
+  **Recurring issues for this developer**
+  
+  Example: "@alice often forgets to close database connections in exception handlers"
+</Card>
+
+<Card title="developer_strength" icon="user-check">
+  **Things this developer does well**
+  
+  Example: "@bob consistently writes comprehensive test coverage for edge cases"
+</Card>
+
+<Card title="risk_module" icon="triangle-exclamation">
+  **Fragile or security-critical files**
+  
+  Example: "app/auth/token_service.py is security-critical; changes here need extra scrutiny"
+</Card>
+
+<Card title="contributor_profile" icon="address-card">
+  **Aggregated profile for this developer**
+  
+  Example: "@charlie works on backend services (auth, payments). Strengths: API design, testing. Feedback: occasionally misses edge cases in error handling. Languages: Python, TypeScript."
+</Card>
+
+</CardGroup>
+
+## Memory Lifecycle
+
+### 1. Search (Before Review)
+
+When building context for a new PR, Nectr queries Mem0 for relevant memories.
+
+```python
+# app/services/context_service.py:72-84
+mem0_results = await asyncio.gather(
+    memory_adapter.search_relevant(
+        repo=repo_full_name,
+        query=query,  # built from PR title + description + file paths
+        developer=None,
+        top_k=12
+    ),
+    memory_adapter.search_relevant(
+        repo=repo_full_name,
+        query="Developer patterns, strengths, recurring issues",
+        developer=author,
+        top_k=5,
+    ) if author else _noop(),
+    return_exceptions=True,
+)
+```
+
+**Query construction** (from `context_service.py:74`):
+```python
+query_parts = [pr_title or "", (pr_description or "")[:300], ", ".join(file_paths[:10])]
+query = " ".join(q for q in query_parts if q).strip() or "Project context, rules, patterns"
+```
+
+Nectr runs two parallel searches:
+1. **Project memories**: Patterns/decisions relevant to this PR's topic and files
+2. **Developer memories**: Patterns/strengths specific to the PR author
+
+### 2. Inject Into Review Context
+
+The retrieved memories are serialized and injected into Claude's prompt.
+
+```python
+# app/services/context_service.py:95-126
+lines: list[str] = []
+
+if project_memories:
+    lines.append("PROJECT INTELLIGENCE:")
+    for m in project_memories[:10]:
+        content = m.get("memory", m.get("content", ""))
+        if content:
+            lines.append(f"- {content}")
+
+if developer_memories:
+    lines.append("")
+    lines.append(f"DEVELOPER CONTEXT ({author}):")
+    for m in developer_memories[:5]:
+        content = m.get("memory", m.get("content", ""))
+        if content:
+            lines.append(f"- {content}")
+
+serialized = "\n".join(lines) if lines else ""
+```
+
+**Example serialized context**:
+```
+PROJECT INTELLIGENCE:
+- This repo uses FastAPI with async SQLAlchemy for database operations
+- Authentication uses JWT tokens stored in httpOnly cookies
+- All API routes require dependency injection for db sessions
+
+DEVELOPER CONTEXT (alice):
+- @alice works on auth services and payment integrations
+- Strengths: API design, comprehensive test coverage
+- Recurring issue: sometimes forgets to handle 401 responses in frontend
+```
+
+### 3. Agentic Tool Access
+
+In agentic review mode, Claude can **search memories on-demand** via tools instead of receiving them upfront.
+
+#### search_project_memory
+
+```python
+# app/services/ai_service.py:38-51
+{
+    "name": "search_project_memory",
+    "description": (
+        "Search the project's accumulated knowledge for patterns, past decisions, "
+        "and known risks relevant to your query. Use this when the diff touches "
+        "an area you want to cross-check against historical context."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to look up, e.g. 'rate limiting strategy' or 'auth token handling'"},
+        },
+        "required": ["query"],
+    },
+}
+```
+
+**Implementation** (from `pr_review_service.py:302-309`):
+```python
+async def _search_project_memory(self, query: str) -> str:
+    results = await memory_adapter.search_relevant(
+        repo=self.repo_full_name, query=query, developer=None, top_k=8
+    )
+    if not results:
+        return "No relevant project memories found."
+    lines = [f"- {m.get('memory', m.get('content', ''))}" for m in results]
+    return "\n".join(lines)
+```
+
+#### search_developer_memory
+
+```python
+# app/services/ai_service.py:53-67
+{
+    "name": "search_developer_memory",
+    "description": (
+        "Search what Nectr has learned about a specific developer — "
+        "their recurring patterns, known strengths, and past issues. "
+        "Use this when the PR author is known and you want to tailor feedback."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "developer": {"type": "string", "description": "GitHub username"},
+            "query": {"type": "string", "description": "What aspect to retrieve, e.g. 'error handling habits'"},
+        },
+        "required": ["developer", "query"],
+    },
+}
+```
+
+**Implementation** (from `pr_review_service.py:311-318`):
+```python
+async def _search_developer_memory(self, developer: str, query: str) -> str:
+    results = await memory_adapter.search_relevant(
+        repo=self.repo_full_name, query=query, developer=developer, top_k=5
+    )
+    if not results:
+        return f"No memories found for @{developer}."
+    lines = [f"- {m.get('memory', m.get('content', ''))}" for m in results]
+    return f"@{developer} memory:\n" + "\n".join(lines)
+```
+
+### 4. Extract (After Review)
+
+After Nectr posts the review, it asks Claude to extract structured learnings.
+
+```python
+# app/services/pr_review_service.py:782-789
+await extract_and_store(
+    repo_full_name=repo_full_name,
+    pr_number=pr_number,
+    author=author,
+    title=pr_title,
+    files=files,
+    review_summary=summary,
+)
+```
+
+**Extraction prompt** (from `memory_extractor.py:26-58`):
+```python
+EXTRACTION_PROMPT = """Given this completed PR review, extract any learnings as structured memories.
+Output each memory as a JSON object on its own line. Only output valid JSON lines, no other text.
+
+Format per line: {{"memory_type": "...", "title": "...", "content": "...", "developer": "..."}}
+
+memory_type must be one of:
+- project_pattern: Architectural patterns confirmed by this PR
+- decision: Approaches approved or rejected (include PR number in content)
+- developer_pattern: Recurring issues for this developer
+- developer_strength: Things this developer does well
+- risk_module: Files that appear fragile or security-critical
+- contributor_profile: Updated aggregated profile for this developer
+
+For contributor_profile:
+  - content must be a single comprehensive summary covering: PR topics worked on, files commonly touched, types of feedback received, strengths, languages used
+  - Always emit exactly one contributor_profile entry per review
+  - developer field must be "{author}"
+  - Absorb the existing profile info below into your updated summary (don't lose old data)
+
+Only extract 2-5 memories total (always include exactly one contributor_profile).
+Be concise. Each content: 1-2 sentences max.
+
+PR #{pr_number} by {author} on {repo}
+Title: {title}
+Files changed: {files}
+Languages detected: {languages}
+
+Existing contributor profile for {author}:
+{existing_profile}
+
+Review:
+{review}
+"""
+```
+
+**Example Claude output**:
+```json
+{"memory_type": "project_pattern", "title": "Async SQLAlchemy", "content": "This repo uses async SQLAlchemy with dependency injection for database sessions", "developer": ""}
+{"memory_type": "decision", "title": "Rejected eager loading", "content": "PR #42: Rejected eager-loading users with all posts due to N+1 risk; approved lazy loading with explicit joins", "developer": ""}
+{"memory_type": "developer_strength", "title": "Test coverage", "content": "@alice consistently writes comprehensive test coverage for edge cases", "developer": "alice"}
+{"memory_type": "contributor_profile", "title": "alice profile", "content": "@alice works on backend services (auth, payments). Strengths: API design, comprehensive testing. Feedback: occasionally misses edge cases in error handling. Languages: Python, TypeScript. Files: app/auth/*, app/payments/*.", "developer": "alice"}
+```
+
+### 5. Store in Mem0
+
+Each extracted memory is stored with project/developer scoping.
+
+```python
+# app/services/memory_extractor.py:128-161
+for line in response_text.strip().split("\n"):
+    obj = json.loads(line)
+    memory_type = obj.get("memory_type", "")
+    if memory_type not in VALID_MEMORY_TYPES:
+        continue
+    
+    title_val = obj.get("title", "Learning")
+    content = obj.get("content", "")
+    developer = obj.get("developer") or author
+    if not content:
+        continue
+    
+    full_content = f"{title_val}: {content}"
+    is_developer_scoped = (
+        memory_type.startswith("developer") or memory_type == "contributor_profile"
+    )
+    
+    await memory_adapter.add_memory(
+        repo=repo_full_name,
+        content=full_content,
+        memory_type=memory_type,
+        developer=developer if is_developer_scoped else None,
+        metadata={
+            "source_pr": pr_number,
+            "username": developer if memory_type == "contributor_profile" else None,
+        },
+    )
+    stored += 1
+```
+
+**Mem0 scoping**:
+- `project_id` = `repo_full_name` (e.g., `"nectr-ai/nectr"`)
+- `user_id` = `developer` for developer-scoped memories, `"project"` for repo-wide memories
+
+## Implementation Details
+
+### MemoryAdapter
+
+Thin async wrapper around Mem0's sync client.
+
+```python
+# app/services/memory_adapter.py:41-174
+class MemoryAdapter:
+    async def add_memory(
+        self,
+        repo: str,
+        content: str,
+        memory_type: str,
+        developer: str | None = None,
+        metadata: dict | None = None,
+    ) -> str | None:
+        """Add a memory. Returns memory id or None."""
+        client = _get_client()
+        if not client:
+            return None
+        
+        meta = metadata or {}
+        meta["memory_type"] = memory_type
+        
+        def _add():
+            return client.add(
+                messages=[{"role": "user", "content": content}],
+                project_id=repo,
+                user_id=developer or "project",
+                metadata=meta,
+                infer=False,
+                version="v2",
+            )
+        
+        try:
+            result = await _run_sync(_add)
+            if isinstance(result, dict) and "results" in result:
+                results = result["results"]
+                if results and isinstance(results[0], dict):
+                    return results[0].get("id")
+            return None
+        except Exception as e:
+            logger.error(f"Mem0 add failed: {e}")
+            return None
+    
+    async def search_relevant(
+        self,
+        repo: str,
+        query: str,
+        developer: str | None = None,
+        top_k: int = 20,
+    ) -> list[dict]:
+        """Query-driven search. Returns only memories relevant to the query."""
+        client = _get_client()
+        if not client:
+            return []
+        
+        filters: dict = {}
+        if developer:
+            filters = {"AND": [{"user_id": developer}]}
+        
+        def _search():
+            return client.search(
+                query=query,
+                project_id=repo,
+                filters=filters if filters else None,
+                top_k=top_k,
+                version="v2",
+            )
+        
+        try:
+            result = await _run_sync(_search)
+            if isinstance(result, dict) and "results" in result:
+                return result["results"]
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception as e:
+            logger.error(f"Mem0 search failed: {e}")
+            return []
+```
+
+**Thread pool usage**: Mem0 client is synchronous, so `_run_sync()` wraps calls in `asyncio.to_thread()` to avoid blocking the async event loop.
+
+### Graceful Degradation
+
+If Mem0 is not configured (no `MEM0_API_KEY`), all operations no-op silently.
+
+```python
+# app/services/memory_adapter.py:20-33
+def _get_client():
+    """Get or create Mem0 client. Returns None if not configured."""
+    global _mem0_client
+    if not settings.MEM0_API_KEY:
+        return None
+    if _mem0_client is None:
+        try:
+            from mem0 import MemoryClient
+            _mem0_client = MemoryClient(api_key=settings.MEM0_API_KEY.strip())
+            logger.info("Mem0 client initialized")
+        except Exception as e:
+            logger.warning(f"Mem0 client init failed: {e}")
+            return None
+    return _mem0_client
+```
+
+## Configuration
+
+### Mem0 Setup
+
+Set your Mem0 API key:
+
+```bash
+MEM0_API_KEY=m0-...
+```
+
+Get your API key from [mem0.ai](https://mem0.ai).
+
+### Memory Management API
+
+Nectr provides REST endpoints to view and manage memories:
+
+#### List Memories
+
+```bash
+GET /api/v1/memory?repo=owner/repo&memory_type=project_pattern
+```
+
+**Response**:
+```json
+[
+  {
+    "id": "mem_abc123",
+    "memory": "Async SQLAlchemy: This repo uses async SQLAlchemy with dependency injection",
+    "metadata": {
+      "memory_type": "project_pattern",
+      "source_pr": 42
+    }
+  }
+]
+```
+
+#### Add Custom Memory
+
+```bash
+POST /api/v1/memory
+Content-Type: application/json
+
+{
+  "repo": "owner/repo",
+  "content": "Custom rule: All mutations must be wrapped in database transactions",
+  "memory_type": "project_pattern",
+  "developer": null
+}
+```
+
+#### Delete Memory
+
+```bash
+DELETE /api/v1/memory/{memory_id}
+```
+
+#### View Project Map
+
+```bash
+GET /api/v1/memory/project-map?repo=owner/repo
+```
+
+Returns a consolidated view of all project-level memories (architecture, conventions, tech stack).
+
+## Contributor Profile Updates
+
+**Special behavior**: `contributor_profile` memories are **additive** — each new PR absorbs the existing profile and updates it.
+
+```python
+# app/services/memory_extractor.py:86-102
+existing_profile = "No profile yet."
+if author:
+    try:
+        profile_hits = await memory_adapter.search_relevant(
+            repo=repo_full_name,
+            query="Contributor profile",
+            developer=author,
+            top_k=3,
+        )
+        for hit in profile_hits:
+            meta = hit.get("metadata") or {}
+            if meta.get("memory_type") == "contributor_profile":
+                existing_profile = hit.get("memory", hit.get("content", ""))[:400]
+                break
+    except Exception as e:
+        logger.debug(f"Could not fetch existing profile for {author}: {e}")
+```
+
+The extraction prompt instructs Claude to **absorb** the old profile into the new one, so historical context isn't lost.
+
+## Performance
+
+<CardGroup cols={2}>
+
+<Card title="Search Latency" icon="magnifying-glass">
+  **Project memories**: 200-500ms
+  
+  **Developer memories**: 100-300ms
+  
+  Parallel: both complete in ~500ms
+</Card>
+
+<Card title="Extraction Time" icon="stopwatch">
+  **Extraction prompt**: 2-4 seconds
+  
+  **Storage (5 memories)**: 500ms-1s
+  
+  Total: ~3-5 seconds per PR
+</Card>
+
+</CardGroup>
+
+## Example Workflow
+
+<Steps>
+
+### PR #1: Initial Auth Service
+
+**Files changed**: `app/auth/token_service.py`, `app/auth/login.py`
+
+**Extracted memories**:
+```json
+{"memory_type": "project_pattern", "content": "Uses JWT tokens stored in httpOnly cookies for auth"}
+{"memory_type": "contributor_profile", "content": "@alice works on auth services. Strengths: API design. Languages: Python."}
+```
+
+### PR #2: Payment Integration
+
+**Files changed**: `app/payments/stripe_client.py`, `app/auth/middleware.py`
+
+**Context fetched**:
+- Project memory: "Uses JWT tokens stored in httpOnly cookies for auth"
+- Developer memory: "@alice works on auth services. Strengths: API design."
+
+**Extracted memories**:
+```json
+{"memory_type": "project_pattern", "content": "Payment webhooks use HMAC-SHA256 signature verification"}
+{"memory_type": "contributor_profile", "content": "@alice works on auth and payment services. Strengths: API design, webhook security. Languages: Python. Files: app/auth/*, app/payments/*."}
+```
+
+### PR #3: Auth Bug Fix
+
+**Files changed**: `app/auth/token_service.py`
+
+**Context fetched**:
+- Project memory: "Uses JWT tokens stored in httpOnly cookies for auth"
+- Project memory: "Payment webhooks use HMAC-SHA256 signature verification"
+- Developer memory: "@alice works on auth and payment services. Strengths: API design, webhook security."
+
+**Extracted memories**:
+```json
+{"memory_type": "developer_pattern", "content": "@alice occasionally forgets to handle token expiry in edge cases"}
+{"memory_type": "risk_module", "content": "app/auth/token_service.py is security-critical; changes need extra scrutiny"}
+{"memory_type": "contributor_profile", "content": "@alice works on auth and payment services. Strengths: API design, webhook security. Feedback: occasionally misses token expiry edge cases. Languages: Python. Files: app/auth/*, app/payments/*."}
+```
+
+</Steps>
+
+**Result**: By PR #3, Nectr has built a rich context about the project's auth patterns and Alice's strengths/weaknesses. Future reviews will be more tailored.
+
+## Related Files
+
+- `app/services/memory_adapter.py` — Mem0 client wrapper ([view source](app/services/memory_adapter.py))
+- `app/services/memory_extractor.py` — Post-review extraction ([view source](app/services/memory_extractor.py))
+- `app/services/context_service.py` — Context building for reviews ([view source](app/services/context_service.py))
+- `app/api/v1/memory.py` — Memory management API ([view source](app/api/v1/memory.py))

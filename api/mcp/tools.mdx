@@ -1,0 +1,442 @@
+---
+title: 'MCP Tools'
+description: 'Callable functions exposed by Nectr MCP server'
+---
+
+## Overview
+
+Nectr's MCP server exposes 4 tools that external agents can invoke to query review data, contributor statistics, PR verdicts, and repository health metrics.
+
+All tools are async functions that return plain Python dicts/lists and implement graceful error handling.
+
+## get_recent_reviews
+
+Get recent PR reviews for a repository with verdicts and summaries.
+
+<ParamField path="repo" type="string" required>
+  Full repository name, e.g., `owner/repo`
+</ParamField>
+
+<ParamField path="limit" type="integer" default={10}>
+  Maximum number of reviews to return (capped at 50)
+</ParamField>
+
+### Returns
+
+List of review objects:
+
+<ResponseField name="id" type="integer" required>
+  Workflow run ID from the database
+</ResponseField>
+
+<ResponseField name="repo" type="string" required>
+  Full repository name
+</ResponseField>
+
+<ResponseField name="pr_number" type="integer">
+  GitHub pull request number
+</ResponseField>
+
+<ResponseField name="verdict" type="string" required>
+  AI verdict: `APPROVED`, `CHANGES_REQUESTED`, `COMMENT`, or `UNKNOWN`
+</ResponseField>
+
+<ResponseField name="summary" type="string" required>
+  Plain-English review summary
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp when the review was created
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Workflow status: `completed`, `failed`, `processing`, or `pending`
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_recent_reviews",
+    "arguments": {
+      "repo": "acme/backend",
+      "limit": 5
+    }
+  }
+}
+```
+
+```json Response
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "id": 42,
+        "repo": "acme/backend",
+        "pr_number": 123,
+        "verdict": "APPROVED",
+        "summary": "Clean authentication implementation with proper error handling and test coverage.",
+        "created_at": "2026-03-10T14:32:15.123456",
+        "status": "completed"
+      },
+      {
+        "id": 41,
+        "repo": "acme/backend",
+        "pr_number": 122,
+        "verdict": "CHANGES_REQUESTED",
+        "summary": "SQL injection vulnerability in query builder. Missing input validation in user controller.",
+        "created_at": "2026-03-09T11:20:03.789012",
+        "status": "completed"
+      }
+    ]
+  }
+}
+```
+</CodeGroup>
+
+### Implementation
+
+Queries the `WorkflowRun` table filtered by `workflow_type = 'pr_review'`, ordered by `created_at DESC`:
+
+```python
+app/mcp/server.py:106
+```
+
+---
+
+## get_contributor_stats
+
+Get top contributors for a repository with PR-touch counts from the Neo4j knowledge graph.
+
+<ParamField path="repo" type="string" required>
+  Full repository name, e.g., `owner/repo`
+</ParamField>
+
+### Returns
+
+List of contributor objects:
+
+<ResponseField name="login" type="string" required>
+  GitHub username
+</ResponseField>
+
+<ResponseField name="pr_count" type="integer" required>
+  Number of PRs that touched files in this repository
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get_contributor_stats",
+    "arguments": {
+      "repo": "acme/backend"
+    }
+  }
+}
+```
+
+```json Response
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "content": [
+      {
+        "login": "alice",
+        "pr_count": 47
+      },
+      {
+        "login": "bob",
+        "pr_count": 32
+      },
+      {
+        "login": "charlie",
+        "pr_count": 18
+      }
+    ]
+  }
+}
+```
+</CodeGroup>
+
+### Implementation
+
+Queries Neo4j using the `graph_builder.get_file_experts()` service:
+
+```python
+app/mcp/server.py:125
+app/services/graph_builder.py (get_file_experts)
+```
+
+<Note>
+Returns an empty list if Neo4j is not configured or the query fails. This ensures graceful degradation.
+</Note>
+
+---
+
+## get_pr_verdict
+
+Get Nectr's AI verdict for a specific pull request.
+
+<ParamField path="repo" type="string" required>
+  Full repository name, e.g., `owner/repo`
+</ParamField>
+
+<ParamField path="pr_number" type="integer" required>
+  GitHub PR number
+</ParamField>
+
+### Returns
+
+Single verdict object or error:
+
+<ResponseField name="repo" type="string" required>
+  Full repository name
+</ResponseField>
+
+<ResponseField name="pr_number" type="integer" required>
+  GitHub pull request number
+</ResponseField>
+
+<ResponseField name="verdict" type="string">
+  AI verdict: `APPROVED`, `CHANGES_REQUESTED`, `COMMENT`, or `UNKNOWN`
+</ResponseField>
+
+<ResponseField name="summary" type="string">
+  Plain-English review summary
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp when the review was created
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error message if the review is not found or the query fails
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "get_pr_verdict",
+    "arguments": {
+      "repo": "acme/backend",
+      "pr_number": 123
+    }
+  }
+}
+```
+
+```json Success Response
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "repo": "acme/backend",
+        "pr_number": 123,
+        "verdict": "APPROVED",
+        "summary": "Clean authentication implementation with proper error handling and test coverage.",
+        "created_at": "2026-03-10T14:32:15.123456"
+      }
+    ]
+  }
+}
+```
+
+```json Not Found Response
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "error": "No review found for acme/backend#123"
+      }
+    ]
+  }
+}
+```
+</CodeGroup>
+
+### Implementation
+
+Queries the `WorkflowRun` table for the most recent 100 `pr_review` workflows, then filters by PR number:
+
+```python
+app/mcp/server.py:138
+```
+
+<Info>
+The search is limited to the last 100 reviews for performance. If the PR is older, it may not be found.
+</Info>
+
+---
+
+## get_repo_health
+
+Get overall repository health metrics and a 0–100 health score.
+
+<ParamField path="repo" type="string" required>
+  Full repository name, e.g., `owner/repo`
+</ParamField>
+
+### Returns
+
+Health metrics object:
+
+<ResponseField name="repo" type="string" required>
+  Full repository name
+</ResponseField>
+
+<ResponseField name="review_coverage_pct" type="integer" required>
+  Percentage of PRs with AI reviews (0–100)
+</ResponseField>
+
+<ResponseField name="avg_merge_time_hours" type="number">
+  Average time from PR open to merge in hours. Currently `null` (requires merge-event tracking).
+</ResponseField>
+
+<ResponseField name="open_prs_indexed" type="integer" required>
+  Number of completed PR reviews in the database
+</ResponseField>
+
+<ResponseField name="health_score" type="integer" required>
+  Overall health score (0–100), derived from review activity
+</ResponseField>
+
+<ResponseField name="note" type="string">
+  Informational note about missing metrics
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error message if the query fails
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "get_repo_health",
+    "arguments": {
+      "repo": "acme/backend"
+    }
+  }
+}
+```
+
+```json Response
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "content": [
+      {
+        "repo": "acme/backend",
+        "review_coverage_pct": 85,
+        "avg_merge_time_hours": null,
+        "open_prs_indexed": 17,
+        "health_score": 85,
+        "note": "avg_merge_time_hours requires merge-event tracking (roadmap item)"
+      }
+    ]
+  }
+}
+```
+</CodeGroup>
+
+### Health Score Calculation
+
+The health score is derived from the number of completed reviews:
+
+```python
+health_score = min(100, int((reviewed_count / 20) * 100))
+```
+
+- 0 reviews → 0% health
+- 10 reviews → 50% health
+- 20+ reviews → 100% health
+
+### Implementation
+
+```python
+app/mcp/server.py:192
+```
+
+<Note>
+`avg_merge_time_hours` is currently `null` because Nectr does not track merge events yet. This is a planned feature.
+</Note>
+
+---
+
+## Error Handling
+
+All tools implement defensive error handling:
+
+1. **Try to query** the database or Neo4j graph
+2. **On exception**, log a warning and return:
+   - Empty list `[]` for list-returning tools
+   - `{"error": "message"}` for object-returning tools
+3. **Never crash** — external agents always get a valid JSON-RPC response
+
+### Example Error
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "result": {
+    "content": []
+  }
+}
+```
+
+## Timeouts
+
+MCP tool calls do not have explicit timeouts. However:
+
+- Database queries use SQLAlchemy's async engine with connection pooling
+- Neo4j queries have a default 30-second timeout
+- FastMCP handles request cancellation if the client disconnects
+
+## Rate Limiting
+
+<Warning>
+The MCP server does **not** implement rate limiting. For production deployments with untrusted clients, add rate limiting middleware at the FastAPI level.
+</Warning>
+
+## Source Code
+
+All tools are implemented in:
+
+```
+app/mcp/server.py:106-237
+```
+
+Helper functions:
+- `_query_db_reviews()` — Database query for reviews (line 33)
+- `_query_contributor_stats()` — Neo4j query for contributors (line 83)

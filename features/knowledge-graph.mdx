@@ -1,0 +1,575 @@
+---
+title: 'Knowledge Graph'
+description: 'Neo4j-powered code graph for structural context'
+icon: 'diagram-project'
+---
+
+## Overview
+
+Nectr builds a **Neo4j knowledge graph** that tracks code ownership, file relationships, and PR history. The graph is used to answer questions like:
+
+- Who are the experts on these files?
+- What past PRs touched the same code?
+- Which files are high-risk (frequent bug fixes)?
+- Which files are dead (never touched by any PR)?
+
+The graph is built incrementally: **Repository + File nodes** are created when you connect a repo, and **PullRequest + Developer nodes** are added after each review.
+
+<Info>
+The knowledge graph provides **structural context** (who touched what) while Mem0 provides **semantic context** (what patterns exist). Together they power Nectr's contextual intelligence.
+</Info>
+
+## Schema
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      NEO4J GRAPH SCHEMA                          │
+│                                                                  │
+│   (Repository)──[:CONTAINS]──►(File)                            │
+│        │                        ▲                               │
+│        │                        │ [:TOUCHES]                    │
+│        │                   (PullRequest)──[:AUTHORED_BY]──►(Developer)
+│        │                        │           │                   │
+│        │                        │           └──[:CONTRIBUTED_TO]┘
+│        │                   [:CLOSES]                            │
+│        │                        │                               │
+│        │                        ▼                               │
+│        └──────────────────►(Issue)                              │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+  Built on repo connect:  Repository + File nodes (full recursive tree)
+  Built on PR review:     PullRequest + Developer nodes + all edges
+
+  Queried for:
+    • File experts    — developers who most frequently touch these files
+    • Related PRs     — past PRs with overlapping file changes
+    • Linked issues   — issues closed by this PR
+```
+
+### Node Types
+
+<Accordion title="Repository">
+**Properties**:
+- `full_name` (string, unique): `"owner/repo"`
+- `scanned_at` (datetime): Last time file tree was rebuilt
+
+**Created**: When you connect a repo via `/api/v1/repos/{owner}/{repo}/install`
+
+**Updated**: When you rescan via `/api/v1/repos/{owner}/{repo}/rescan`
+
+```cypher
+MERGE (r:Repository {full_name: $full_name})
+SET r.scanned_at = $now
+```
+</Accordion>
+
+<Accordion title="File">
+**Properties**:
+- `repo` (string): `"owner/repo"`
+- `path` (string): Repo-relative path, e.g. `"app/services/pr_review_service.py"`
+- `language` (string): Inferred from extension (Python, JavaScript, TypeScript, etc.)
+- `size` (integer): File size in bytes
+
+**Unique constraint**: `(repo, path)`
+
+**Created**: On repo connect (full recursive tree from GitHub)
+
+**Updated**: On rescan (stale files deleted, new files added)
+
+```cypher
+MERGE (file:File {repo: $repo, path: $path})
+SET file.language = $language, file.size = $size
+```
+</Accordion>
+
+<Accordion title="PullRequest">
+**Properties**:
+- `repo` (string): `"owner/repo"`
+- `number` (integer): PR number
+- `title` (string): PR title
+- `author` (string): GitHub username
+- `verdict` (string): `"APPROVE"` | `"REQUEST_CHANGES"` | `"NEEDS_DISCUSSION"`
+- `reviewed_at` (datetime): When Nectr posted the review
+
+**Unique constraint**: `(repo, number)`
+
+**Created**: After each PR review is posted
+
+```cypher
+MERGE (pr:PullRequest {repo: $repo, number: $number})
+SET pr.title = $title,
+    pr.author = $author,
+    pr.verdict = $verdict,
+    pr.reviewed_at = $now
+```
+</Accordion>
+
+<Accordion title="Developer">
+**Properties**:
+- `login` (string, unique): GitHub username
+
+**Created**: When a PR is indexed and the author doesn't exist yet
+
+```cypher
+MERGE (d:Developer {login: $login})
+```
+</Accordion>
+
+<Accordion title="Issue">
+**Properties**:
+- `repo` (string): `"owner/repo"`
+- `number` (integer): Issue number
+
+**Unique constraint**: `(repo, number)`
+
+**Created**: When a PR references an issue via `Fixes #N`, `Closes #N`, or semantic match
+
+```cypher
+MERGE (i:Issue {repo: $repo, number: $number})
+```
+</Accordion>
+
+### Edge Types
+
+<CardGroup cols={2}>
+
+<Card title="CONTAINS" icon="folder">
+  `(Repository)-[:CONTAINS]->(File)`
+  
+  Links a repository to all files in its tree
+</Card>
+
+<Card title="TOUCHES" icon="hand-pointer">
+  `(PullRequest)-[:TOUCHES]->(File)`
+  
+  Links a PR to every file it modified
+</Card>
+
+<Card title="AUTHORED_BY" icon="user">
+  `(PullRequest)-[:AUTHORED_BY]->(Developer)`
+  
+  Links a PR to its author
+</Card>
+
+<Card title="CONTRIBUTED_TO" icon="code-commit">
+  `(Developer)-[:CONTRIBUTED_TO]->(Repository)`
+  
+  Tracks which developers have contributed to which repos
+</Card>
+
+<Card title="CLOSES" icon="circle-check">
+  `(PullRequest)-[:CLOSES]->(Issue)`
+  
+  Links a PR to issues it resolves
+</Card>
+
+</CardGroup>
+
+## Graph Operations
+
+### Build Repo Graph
+
+Called when you connect a repo (and on manual rescan). Fetches the full recursive file tree from GitHub and creates **Repository + File nodes** + **CONTAINS edges**.
+
+```python
+# app/services/graph_builder.py:93-194
+async def build_repo_graph(owner: str, repo: str, access_token: str) -> int:
+    repo_full_name = f"{owner}/{repo}"
+    
+    # Fetch recursive tree from GitHub
+    blobs = await _fetch_file_tree(owner, repo, access_token)
+    
+    async with get_session() as session:
+        # Upsert Repository node
+        await session.run(
+            """
+            MERGE (r:Repository {full_name: $full_name})
+            SET r.scanned_at = $now
+            """,
+            full_name=repo_full_name,
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+        
+        # Batch-upsert File nodes (200 at a time)
+        for i in range(0, len(blobs), 200):
+            chunk = blobs[i : i + 200]
+            files_data = [
+                {
+                    "path": b["path"],
+                    "language": _lang_from_path(b["path"]),
+                    "size": b.get("size", 0),
+                }
+                for b in chunk
+            ]
+            await session.run(
+                """
+                UNWIND $files AS f
+                MERGE (file:File {repo: $repo, path: f.path})
+                SET file.language = f.language, file.size = f.size
+                WITH file
+                MERGE (r:Repository {full_name: $repo})
+                MERGE (r)-[:CONTAINS]->(file)
+                """,
+                repo=repo_full_name,
+                files=files_data,
+            )
+        
+        # Remove stale File nodes (files deleted from repo)
+        current_paths = [b["path"] for b in blobs]
+        await session.run(
+            """
+            MATCH (r:Repository {full_name: $repo})-[:CONTAINS]->(f:File)
+            WHERE NOT f.path IN $paths
+            DETACH DELETE f
+            """,
+            repo=repo_full_name,
+            paths=current_paths,
+        )
+    
+    return len(blobs)
+```
+
+**Performance**: Processes 200 files per batch. A 5000-file repo takes ~3 seconds.
+
+<Note>
+GitHub caps the recursive tree API at ~100k nodes. For monorepos, the tree may be truncated. Nectr logs a warning but continues with the partial set.
+</Note>
+
+### Index PR
+
+Called after each PR review. Creates **PullRequest + Developer nodes** and edges (**TOUCHES**, **AUTHORED_BY**, **CLOSES**, **CONTRIBUTED_TO**).
+
+```python
+# app/services/graph_builder.py:197-288
+async def index_pr(
+    repo_full_name: str,
+    pr_number: int,
+    title: str,
+    author: str,
+    files_changed: list[str],
+    verdict: str,
+    issue_numbers: list[int] | None = None,
+) -> None:
+    async with get_session() as session:
+        # Upsert PullRequest node
+        await session.run(
+            """
+            MERGE (pr:PullRequest {repo: $repo, number: $number})
+            SET pr.title = $title,
+                pr.author = $author,
+                pr.verdict = $verdict,
+                pr.reviewed_at = $now
+            """,
+            repo=repo_full_name, number=pr_number, title=title,
+            author=author, verdict=verdict,
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+        
+        # Create Developer node + AUTHORED_BY + CONTRIBUTED_TO edges
+        if author:
+            await session.run(
+                """
+                MERGE (d:Developer {login: $login})
+                WITH d
+                MATCH (pr:PullRequest {repo: $repo, number: $number})
+                MERGE (pr)-[:AUTHORED_BY]->(d)
+                WITH d
+                MERGE (r:Repository {full_name: $repo})
+                MERGE (d)-[:CONTRIBUTED_TO]->(r)
+                """,
+                login=author, repo=repo_full_name, number=pr_number,
+            )
+        
+        # TOUCHES edges for changed files
+        if files_changed:
+            files_data = [{"path": p, "language": _lang_from_path(p)} for p in files_changed]
+            await session.run(
+                """
+                UNWIND $files AS f
+                MATCH (pr:PullRequest {repo: $repo, number: $number})
+                MERGE (file:File {repo: $repo, path: f.path})
+                ON CREATE SET file.language = f.language
+                MERGE (pr)-[:TOUCHES]->(file)
+                """,
+                repo=repo_full_name, number=pr_number, files=files_data,
+            )
+        
+        # CLOSES edges for resolved issues
+        if issue_numbers:
+            await session.run(
+                """
+                UNWIND $issue_nums AS issue_num
+                MERGE (i:Issue {repo: $repo, number: issue_num})
+                WITH i, issue_num
+                MATCH (pr:PullRequest {repo: $repo, number: $pr_num})
+                MERGE (pr)-[:CLOSES]->(i)
+                """,
+                repo=repo_full_name, issue_nums=issue_numbers, pr_num=pr_number,
+            )
+```
+
+**Race condition fix**: Uses `MERGE` for Repository node (not `MATCH`) so `CONTRIBUTED_TO` edge is never silently dropped if `index_pr()` runs before `build_repo_graph()` completes.
+
+### Query Operations
+
+#### Get File Experts
+
+Returns developers who have most frequently touched the given files.
+
+```python
+# app/services/graph_builder.py:294-324
+async def get_file_experts(
+    repo_full_name: str,
+    file_paths: list[str],
+    top_k: int = 5,
+) -> list[dict]:
+    async with get_session() as session:
+        result = await session.run(
+            """
+            UNWIND $paths AS path
+            MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File {repo: $repo, path: path})
+            MATCH (pr)-[:AUTHORED_BY]->(d:Developer)
+            RETURN d.login AS login, count(*) AS touch_count
+            ORDER BY touch_count DESC
+            LIMIT $top_k
+            """,
+            repo=repo_full_name, paths=file_paths, top_k=top_k,
+        )
+        return [{"login": r["login"], "touch_count": r["touch_count"]} async for r in result]
+```
+
+**Example result**:
+```json
+[
+  {"login": "alice", "touch_count": 12},
+  {"login": "bob", "touch_count": 7},
+  {"login": "charlie", "touch_count": 3}
+]
+```
+
+#### Get Related PRs
+
+Returns past PRs that touched the same files (structural similarity).
+
+```python
+# app/services/graph_builder.py:327-374
+async def get_related_prs(
+    repo_full_name: str,
+    file_paths: list[str],
+    exclude_pr: int | None = None,
+    top_k: int = 5,
+) -> list[dict]:
+    async with get_session() as session:
+        result = await session.run(
+            """
+            UNWIND $paths AS path
+            MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File {repo: $repo, path: path})
+            WHERE ($exclude IS NULL OR pr.number <> $exclude)
+              AND pr.verdict IS NOT NULL
+            WITH pr, count(DISTINCT f) AS overlap
+            ORDER BY overlap DESC
+            LIMIT $top_k
+            RETURN pr.number AS number,
+                   pr.title AS title,
+                   pr.author AS author,
+                   pr.verdict AS verdict,
+                   overlap
+            """,
+            repo=repo_full_name, paths=file_paths, exclude=exclude_pr, top_k=top_k,
+        )
+        return [
+            {
+                "number": r["number"],
+                "title": r["title"],
+                "author": r["author"],
+                "verdict": r["verdict"],
+                "overlap": r["overlap"],
+            }
+            async for r in result
+        ]
+```
+
+**Example result**:
+```json
+[
+  {"number": 42, "title": "Refactor auth service", "author": "alice", "verdict": "APPROVE", "overlap": 3},
+  {"number": 38, "title": "Fix login redirect", "author": "bob", "verdict": "REQUEST_CHANGES", "overlap": 2}
+]
+```
+
+#### Get Linked Issues
+
+Batch-fetch Issue nodes and which PRs closed them.
+
+```python
+# app/services/graph_builder.py:377-413
+async def get_linked_issues(
+    repo_full_name: str,
+    issue_numbers: list[int],
+) -> list[dict]:
+    async with get_session() as session:
+        result = await session.run(
+            """
+            UNWIND $nums AS num
+            OPTIONAL MATCH (i:Issue {repo: $repo, number: num})
+            OPTIONAL MATCH (pr:PullRequest)-[:CLOSES]->(i)
+            RETURN num,
+                   i IS NOT NULL AS found,
+                   collect(pr.number) AS closed_by
+            """,
+            repo=repo_full_name, nums=issue_numbers,
+        )
+        return [
+            {"number": r["num"], "closed_by": r["closed_by"]}
+            async for r in result
+        ]
+```
+
+**Example result**:
+```json
+[
+  {"number": 12, "closed_by": [42, 38]},
+  {"number": 15, "closed_by": []}
+]
+```
+
+## Analytics Queries
+
+The knowledge graph powers the Analytics dashboard with insights like:
+
+### File Hotspots
+
+Files touched by the most PRs (high churn / high importance).
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File)
+RETURN f.path AS path, f.language AS language, count(pr) AS pr_count
+ORDER BY pr_count DESC LIMIT 10
+```
+
+### High-Risk Files
+
+Files that repeatedly get `REQUEST_CHANGES` verdict (fragile, needs attention).
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo, verdict: "REQUEST_CHANGES"})-[:TOUCHES]->(f:File)
+RETURN f.path AS path, f.language AS language, count(pr) AS risk_count
+ORDER BY risk_count DESC LIMIT 8
+```
+
+### Dead Files
+
+Files in the repo never touched by any reviewed PR (potentially stale/unused).
+
+```cypher
+MATCH (r:Repository {full_name: $repo})-[:CONTAINS]->(f:File)
+WHERE NOT (f)<-[:TOUCHES]-()
+RETURN f.path AS path, f.language AS language
+```
+
+### Code Ownership
+
+For each heavily-touched file, who is the dominant contributor.
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo})-[:AUTHORED_BY]->(d:Developer),
+      (pr)-[:TOUCHES]->(f:File)
+WITH f.path AS path, d.login AS dev, count(*) AS touches
+ORDER BY path, touches DESC
+WITH path,
+     collect({dev: dev, touches: touches})[0] AS top_owner,
+     sum(touches) AS total_touches
+WHERE total_touches >= 2
+RETURN path, top_owner.dev AS owner, top_owner.touches AS owner_touches, total_touches
+ORDER BY total_touches DESC LIMIT 10
+```
+
+### Developer Expertise
+
+Per developer: which top-level directories they contribute to most.
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo})-[:AUTHORED_BY]->(d:Developer),
+      (pr)-[:TOUCHES]->(f:File)
+WITH d.login AS dev,
+     CASE WHEN size(split(f.path, '/')) > 1
+          THEN split(f.path, '/')[0]
+          ELSE '(root)' END AS directory,
+     count(*) AS touches
+ORDER BY dev, touches DESC
+WITH dev,
+     collect({directory: directory, touches: touches})[0..4] AS top_dirs,
+     sum(touches) AS total_touches
+RETURN dev, top_dirs, total_touches
+ORDER BY total_touches DESC LIMIT 8
+```
+
+## Configuration
+
+### Neo4j Connection
+
+Set these environment variables:
+
+```bash
+NEO4J_URI=neo4j+s://xxx.databases.neo4j.io
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=...
+```
+
+### Graceful Degradation
+
+If Neo4j is unavailable, Nectr silently skips graph queries and continues with Mem0 context only. PR reviews still work.
+
+```python
+# app/services/graph_builder.py:103-106
+if not is_available():
+    if raise_on_error:
+        raise RuntimeError("Neo4j is not available")
+    return 0
+```
+
+## Performance
+
+<CardGroup cols={2}>
+
+<Card title="Repo Scan" icon="stopwatch">
+  **5000 files**: ~3 seconds
+  
+  **20000 files**: ~12 seconds
+  
+  Batch size: 200 files per write
+</Card>
+
+<Card title="Query Latency" icon="gauge">
+  **File experts**: 10-50ms
+  
+  **Related PRs**: 20-100ms
+  
+  **Analytics (complex)**: 100-500ms
+</Card>
+
+</CardGroup>
+
+## Constraints & Indexes
+
+Nectr creates constraints and indexes on startup to ensure fast queries:
+
+```cypher
+-- Unique constraints (also create indexes)
+CREATE CONSTRAINT repo_full_name IF NOT EXISTS FOR (r:Repository) REQUIRE r.full_name IS UNIQUE
+CREATE CONSTRAINT file_repo_path IF NOT EXISTS FOR (f:File) REQUIRE (f.repo, f.path) IS UNIQUE
+CREATE CONSTRAINT pr_repo_number IF NOT EXISTS FOR (pr:PullRequest) REQUIRE (pr.repo, pr.number) IS UNIQUE
+CREATE CONSTRAINT dev_login IF NOT EXISTS FOR (d:Developer) REQUIRE d.login IS UNIQUE
+CREATE CONSTRAINT issue_repo_number IF NOT EXISTS FOR (i:Issue) REQUIRE (i.repo, i.number) IS UNIQUE
+
+-- Additional indexes for common queries
+CREATE INDEX file_language IF NOT EXISTS FOR (f:File) ON (f.language)
+CREATE INDEX pr_verdict IF NOT EXISTS FOR (pr:PullRequest) ON (pr.verdict)
+```
+
+## Related Files
+
+- `app/services/graph_builder.py` — All Neo4j operations ([view source](app/services/graph_builder.py))
+- `app/core/neo4j_client.py` — Async driver singleton ([view source](app/core/neo4j_client.py))
+- `app/core/neo4j_schema.py` — Constraints + indexes ([view source](app/core/neo4j_schema.py))

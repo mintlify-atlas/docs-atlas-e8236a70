@@ -1,0 +1,428 @@
+---
+title: "Neo4j Knowledge Graph"
+description: "Graph schema, nodes, relationships, and query patterns"
+---
+
+## Overview
+
+Nectr uses **Neo4j** as a knowledge graph to track structural relationships between repositories, files, developers, pull requests, and issues.
+
+<Note>
+  Neo4j is **optional**. If not configured, Nectr degrades gracefully (file experts and related PRs won't be available, but reviews still work).
+</Note>
+
+## Graph Schema
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                      NEO4J GRAPH SCHEMA                          │
+  │                                                                  │
+  │   (Repository)──[:CONTAINS]──►(File)                            │
+  │        │                        ▲                               │
+  │        │                        │ [:TOUCHES]                    │
+  │        │                   (PullRequest)──[:AUTHORED_BY]──►(Developer)
+  │        │                        │           │                   │
+  │        │                        │           └──[:CONTRIBUTED_TO]┘
+  │        │                   [:CLOSES]                            │
+  │        │                        │                               │
+  │        │                        ▼                               │
+  │        └────────────────►(Issue)                              │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Built on repo connect:  Repository + File nodes (full recursive tree)
+  Built on PR review:     PullRequest + Developer nodes + all edges
+
+  Queried for:
+    • File experts    — developers who most frequently touch these files
+    • Related PRs     — past PRs with overlapping file changes
+    • Linked issues   — issues closed by this PR
+```
+
+## Node Types
+
+### Repository
+
+**Created:** When a repo is connected via `/api/v1/repos/{owner}/{repo}/install`
+
+| Property | Type | Description |
+|----------|------|--------------|
+| `full_name` | `String` | Repo name (e.g., `owner/repo`) — **unique** |
+| `scanned_at` | `DateTime` | When file tree was last scanned |
+
+<Accordion title="Cypher: Create Repository">
+```cypher
+MERGE (r:Repository {full_name: $full_name})
+SET r.scanned_at = $now
+```
+</Accordion>
+
+### File
+
+**Created:** When a repo is scanned (`build_repo_graph`)
+
+| Property | Type | Description |
+|----------|------|--------------|
+| `repo` | `String` | Parent repo (e.g., `owner/repo`) |
+| `path` | `String` | File path (e.g., `app/auth/jwt_utils.py`) |
+| `language` | `String` | Inferred from extension (e.g., `Python`) |
+| `size` | `Integer` | File size in bytes |
+
+<Accordion title="Cypher: Create File">
+```cypher
+UNWIND $files AS f
+MERGE (file:File {repo: $repo, path: f.path})
+SET file.language = f.language, file.size = f.size
+WITH file
+MERGE (r:Repository {full_name: $repo})
+MERGE (r)-[:CONTAINS]->(file)
+```
+</Accordion>
+
+<Note>
+  **Composite key:** `(repo, path)` uniquely identifies a file. This allows multiple repos to have files with the same path.
+</Note>
+
+### PullRequest
+
+**Created:** When a PR review is completed (`index_pr`)
+
+| Property | Type | Description |
+|----------|------|--------------|
+| `repo` | `String` | Parent repo |
+| `number` | `Integer` | PR number (e.g., `42`) — **unique per repo** |
+| `title` | `String` | PR title |
+| `author` | `String` | GitHub username |
+| `verdict` | `String` | AI verdict (`APPROVE`, `REQUEST_CHANGES`, `NEEDS_DISCUSSION`) |
+| `reviewed_at` | `DateTime` | When Nectr posted the review |
+
+<Accordion title="Cypher: Create PullRequest">
+```cypher
+MERGE (pr:PullRequest {repo: $repo, number: $number})
+SET pr.title = $title,
+    pr.author = $author,
+    pr.verdict = $verdict,
+    pr.reviewed_at = $now
+```
+</Accordion>
+
+### Developer
+
+**Created:** When a PR is indexed (`index_pr`)
+
+| Property | Type | Description |
+|----------|------|--------------|
+| `login` | `String` | GitHub username (e.g., `alice`) — **unique** |
+
+<Accordion title="Cypher: Create Developer">
+```cypher
+MERGE (d:Developer {login: $login})
+WITH d
+MATCH (pr:PullRequest {repo: $repo, number: $number})
+MERGE (pr)-[:AUTHORED_BY]->(d)
+WITH d
+MERGE (r:Repository {full_name: $repo})
+MERGE (d)-[:CONTRIBUTED_TO]->(r)
+```
+</Accordion>
+
+### Issue
+
+**Created:** When a PR closes an issue (`index_pr`)
+
+| Property | Type | Description |
+|----------|------|--------------|
+| `repo` | `String` | Parent repo |
+| `number` | `Integer` | Issue number (e.g., `123`) — **unique per repo** |
+
+<Accordion title="Cypher: Create Issue">
+```cypher
+UNWIND $issue_nums AS issue_num
+MERGE (i:Issue {repo: $repo, number: issue_num})
+WITH i
+MATCH (pr:PullRequest {repo: $repo, number: $pr_num})
+MERGE (pr)-[:CLOSES]->(i)
+```
+</Accordion>
+
+## Relationship Types
+
+### [:CONTAINS]
+
+**Direction:** `Repository → File`  
+**Cardinality:** 1:N (one repo contains many files)
+
+<Accordion title="Example Query">
+```cypher
+MATCH (r:Repository {full_name: "alice/backend"})-[:CONTAINS]->(f:File)
+WHERE f.language = "Python"
+RETURN f.path, f.size
+ORDER BY f.size DESC
+LIMIT 10
+```
+
+**Use case:** Find the largest Python files in a repo.
+</Accordion>
+
+### [:TOUCHES]
+
+**Direction:** `PullRequest → File`  
+**Cardinality:** N:M (a PR touches many files, a file is touched by many PRs)
+
+<Accordion title="Example Query">
+```cypher
+MATCH (pr:PullRequest {repo: "alice/backend", number: 42})-[:TOUCHES]->(f:File)
+RETURN f.path, f.language
+```
+
+**Use case:** List all files changed in PR #42.
+</Accordion>
+
+### [:AUTHORED_BY]
+
+**Direction:** `PullRequest → Developer`  
+**Cardinality:** N:1 (many PRs by one developer)
+
+<Accordion title="Example Query">
+```cypher
+MATCH (pr:PullRequest {repo: "alice/backend"})-[:AUTHORED_BY]->(d:Developer)
+RETURN d.login, count(pr) AS pr_count
+ORDER BY pr_count DESC
+LIMIT 5
+```
+
+**Use case:** Find top contributors by PR count.
+</Accordion>
+
+### [:CONTRIBUTED_TO]
+
+**Direction:** `Developer → Repository`  
+**Cardinality:** N:M (a developer contributes to many repos)
+
+<Accordion title="Example Query">
+```cypher
+MATCH (d:Developer {login: "alice"})-[:CONTRIBUTED_TO]->(r:Repository)
+RETURN r.full_name
+```
+
+**Use case:** List all repos a developer has contributed to.
+</Accordion>
+
+### [:CLOSES]
+
+**Direction:** `PullRequest → Issue`  
+**Cardinality:** N:M (a PR can close multiple issues, an issue can be closed by multiple PRs)
+
+<Accordion title="Example Query">
+```cypher
+MATCH (pr:PullRequest {repo: "alice/backend"})-[:CLOSES]->(i:Issue)
+RETURN pr.number, pr.title, collect(i.number) AS closed_issues
+ORDER BY pr.number DESC
+LIMIT 10
+```
+
+**Use case:** List recent PRs and the issues they closed.
+</Accordion>
+
+## Constraints & Indexes
+
+**File:** `app/core/neo4j_schema.py`
+
+<Accordion title="Constraints">
+```cypher
+-- Repository: unique by full_name
+CREATE CONSTRAINT repo_full_name IF NOT EXISTS
+FOR (r:Repository) REQUIRE r.full_name IS UNIQUE;
+
+-- Developer: unique by login
+CREATE CONSTRAINT dev_login IF NOT EXISTS
+FOR (d:Developer) REQUIRE d.login IS UNIQUE;
+
+-- PullRequest: unique by (repo, number)
+CREATE CONSTRAINT pr_repo_number IF NOT EXISTS
+FOR (pr:PullRequest) REQUIRE (pr.repo, pr.number) IS UNIQUE;
+
+-- Issue: unique by (repo, number)
+CREATE CONSTRAINT issue_repo_number IF NOT EXISTS
+FOR (i:Issue) REQUIRE (i.repo, i.number) IS UNIQUE;
+
+-- File: unique by (repo, path)
+CREATE CONSTRAINT file_repo_path IF NOT EXISTS
+FOR (f:File) REQUIRE (f.repo, f.path) IS UNIQUE;
+```
+</Accordion>
+
+<Accordion title="Indexes">
+```cypher
+-- Index on File.language for faster filtering
+CREATE INDEX file_language IF NOT EXISTS
+FOR (f:File) ON (f.language);
+
+-- Index on PullRequest.verdict for analytics
+CREATE INDEX pr_verdict IF NOT EXISTS
+FOR (pr:PullRequest) ON (pr.verdict);
+```
+</Accordion>
+
+## Common Queries
+
+### File Experts
+
+**Find developers who most frequently touched given files.**
+
+```cypher
+UNWIND $paths AS path
+MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File {repo: $repo, path: path})
+MATCH (pr)-[:AUTHORED_BY]->(d:Developer)
+RETURN d.login AS login, count(*) AS touch_count
+ORDER BY touch_count DESC
+LIMIT $top_k
+```
+
+<Accordion title="Example (Python)">
+```python
+from app.services import graph_builder
+
+experts = await graph_builder.get_file_experts(
+    repo_full_name="alice/backend",
+    file_paths=["app/auth/jwt_utils.py", "app/auth/dependencies.py"],
+    top_k=5,
+)
+# [{"login": "alice", "touch_count": 12}, {"login": "bob", "touch_count": 8}, ...]
+```
+</Accordion>
+
+### Related Past PRs
+
+**Find past PRs that touched the same files (structural similarity).**
+
+```cypher
+UNWIND $paths AS path
+MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File {repo: $repo, path: path})
+WHERE ($exclude IS NULL OR pr.number <> $exclude)
+  AND pr.verdict IS NOT NULL
+WITH pr, count(DISTINCT f) AS overlap
+ORDER BY overlap DESC
+LIMIT $top_k
+RETURN pr.number AS number,
+       pr.title AS title,
+       pr.author AS author,
+       pr.verdict AS verdict,
+       overlap
+```
+
+<Accordion title="Example (Python)">
+```python
+related = await graph_builder.get_related_prs(
+    repo_full_name="alice/backend",
+    file_paths=["app/auth/jwt_utils.py", "app/auth/dependencies.py"],
+    exclude_pr=42,  # Don't include current PR
+    top_k=5,
+)
+# [{"number": 38, "title": "Add JWT refresh", "author": "bob", "verdict": "APPROVE", "overlap": 2}, ...]
+```
+</Accordion>
+
+### File Hotspots
+
+**Find files touched by the most PRs (high churn → high importance or fragility).**
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File)
+RETURN f.path AS path, f.language AS language, count(pr) AS pr_count
+ORDER BY pr_count DESC
+LIMIT $limit
+```
+
+<Accordion title="Example (Python)">
+```python
+hotspots = await graph_builder.get_file_hotspots(
+    repo_full_name="alice/backend",
+    limit=10,
+)
+# [{"path": "app/main.py", "language": "Python", "pr_count": 45}, ...]
+```
+</Accordion>
+
+### High-Risk Files
+
+**Find files repeatedly flagged in PRs with `REQUEST_CHANGES` verdict.**
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo, verdict: "REQUEST_CHANGES"})-[:TOUCHES]->(f:File)
+RETURN f.path AS path, f.language AS language, count(pr) AS risk_count
+ORDER BY risk_count DESC
+LIMIT $limit
+```
+
+<Accordion title="Example (Python)">
+```python
+risky = await graph_builder.get_high_risk_files(
+    repo_full_name="alice/backend",
+    limit=8,
+)
+# [{"path": "app/auth/jwt_utils.py", "language": "Python", "risk_count": 7}, ...]
+```
+</Accordion>
+
+### Code Ownership
+
+**For each heavily-touched file, who is the dominant contributor?**
+
+```cypher
+MATCH (pr:PullRequest {repo: $repo})-[:AUTHORED_BY]->(d:Developer),
+      (pr)-[:TOUCHES]->(f:File)
+WITH f.path AS path, d.login AS dev, count(*) AS touches
+ORDER BY path, touches DESC
+WITH path,
+     collect({dev: dev, touches: touches})[0] AS top_owner,
+     sum(touches) AS total_touches
+WHERE total_touches >= 2
+RETURN path, top_owner.dev AS owner, top_owner.touches AS owner_touches, total_touches
+ORDER BY total_touches DESC
+LIMIT $limit
+```
+
+<Accordion title="Example (Python)">
+```python
+ownership = await graph_builder.get_code_ownership(
+    repo_full_name="alice/backend",
+    limit=10,
+)
+# [{"path": "app/main.py", "owner": "alice", "owner_touches": 28, "total_touches": 45}, ...]
+```
+</Accordion>
+
+## Performance Characteristics
+
+| Query | Typical Latency | Notes |
+|-------|-----------------|-------|
+| `get_file_experts()` | 50-150 ms | Indexed on `(repo, path)` |
+| `get_related_prs()` | 80-200 ms | Indexed on `(repo, number)` |
+| `get_file_hotspots()` | 100-300 ms | Aggregates all PRs in repo |
+| `get_high_risk_files()` | 120-350 ms | Filters by verdict + aggregates |
+| `build_repo_graph()` | 5-15 seconds | Batches 200 files per write |
+| `index_pr()` | 100-300 ms | 4 Cypher queries (batched) |
+
+<Note>
+  **Neo4j Aura Free Tier** is sufficient for repos with < 10,000 files and < 1,000 PRs. Larger repos should use a paid tier or self-hosted instance.
+</Note>
+
+## Data Volume Estimates
+
+| Repo Size | Nodes | Relationships | Disk Usage |
+|-----------|-------|---------------|------------|
+| Small (< 500 files, < 100 PRs) | ~700 | ~1,500 | ~5 MB |
+| Medium (1,000 files, 500 PRs) | ~1,700 | ~7,500 | ~25 MB |
+| Large (5,000 files, 2,000 PRs) | ~7,500 | ~35,000 | ~120 MB |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Service Layer" icon="cog" href="/architecture/services">
+    Learn how graph_builder service uses Neo4j
+  </Card>
+  <Card title="MCP Client" icon="plug" href="/architecture/mcp-client">
+    Explore MCP integrations (Linear, Sentry, Slack)
+  </Card>
+</CardGroup>

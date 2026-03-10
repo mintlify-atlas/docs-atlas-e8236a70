@@ -1,0 +1,264 @@
+---
+title: 'GitHub Webhook'
+description: 'Receive pull request events from GitHub'
+---
+
+## Overview
+
+The GitHub webhook endpoint receives per-repository webhook events from GitHub when pull requests are opened or updated. Nectr responds immediately (within GitHub's 10-second timeout) and processes reviews asynchronously in the background.
+
+<Note>
+Nectr uses **per-repository webhooks** only. GitHub App integration events are not supported.
+</Note>
+
+## Endpoint
+
+```
+POST /api/v1/webhooks/github
+```
+
+## Security
+
+All webhook payloads are verified using HMAC-SHA256 signatures. Nectr checks the `X-Hub-Signature-256` header against the per-repository webhook secret stored in the database.
+
+<Steps>
+  <Step title="Signature Verification">
+    The webhook secret is retrieved from the `Installation` table for the repository. If not found, falls back to the global `GITHUB_WEBHOOK_SECRET` environment variable.
+  </Step>
+  
+  <Step title="HMAC-SHA256 Comparison">
+    Computes `sha256=<hmac_hex>` using the webhook secret and compares it against the provided signature using constant-time comparison.
+  </Step>
+  
+  <Step title="Rejection">
+    Returns `403 Forbidden` if the signature does not match (production only).
+  </Step>
+</Steps>
+
+## Headers
+
+<ParamField header="X-Hub-Signature-256" type="string" required>
+  HMAC-SHA256 signature of the request body, prefixed with `sha256=`
+</ParamField>
+
+<ParamField header="X-GitHub-Hook-Installation-Target-Type" type="string">
+  Hook delivery type. Must be `repository`. Events with value `integration` (GitHub App) are rejected.
+</ParamField>
+
+<ParamField header="X-GitHub-Event" type="string">
+  GitHub event type (e.g., `pull_request`, `issues`, `push`)
+</ParamField>
+
+## Request Body
+
+The request body is the standard GitHub webhook payload in JSON format. The exact schema depends on the event type.
+
+### Pull Request Events
+
+<CodeGroup>
+```json Pull Request Opened
+{
+  "action": "opened",
+  "number": 123,
+  "pull_request": {
+    "number": 123,
+    "title": "Add user authentication",
+    "state": "open",
+    "user": {
+      "login": "developer123"
+    },
+    "head": {
+      "sha": "abc123def456",
+      "ref": "feature/auth"
+    },
+    "base": {
+      "sha": "def456abc789",
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/backend",
+    "name": "backend",
+    "owner": {
+      "login": "acme"
+    }
+  },
+  "sender": {
+    "login": "developer123"
+  }
+}
+```
+
+```json Pull Request Synchronized
+{
+  "action": "synchronize",
+  "number": 123,
+  "pull_request": {
+    "number": 123,
+    "title": "Add user authentication",
+    "state": "open"
+  },
+  "repository": {
+    "full_name": "acme/backend"
+  }
+}
+```
+</CodeGroup>
+
+## Response
+
+The endpoint returns immediately with a `200 OK` status to avoid GitHub's timeout.
+
+<ResponseField name="status" type="string" required>
+  One of: `received`, `duplicate_skipped`, or `ignored`
+</ResponseField>
+
+<ResponseField name="event_id" type="integer">
+  Database ID of the created event (only when status is `received`)
+</ResponseField>
+
+<ResponseField name="event_type" type="string">
+  Derived event type (e.g., `opened_pull_request`, `synchronize_pull_request`)
+</ResponseField>
+
+<ResponseField name="reason" type="string">
+  Reason for ignoring or skipping the event
+</ResponseField>
+
+<ResponseField name="detail" type="string">
+  Additional details when event is duplicate
+</ResponseField>
+
+<CodeGroup>
+```json Success Response
+{
+  "status": "received",
+  "event_id": 42,
+  "event_type": "opened_pull_request"
+}
+```
+
+```json Duplicate Event
+{
+  "status": "duplicate_skipped",
+  "detail": "Event already exists for acme/backend#123"
+}
+```
+
+```json GitHub App Event
+{
+  "status": "ignored",
+  "reason": "GitHub App events not supported"
+}
+```
+</CodeGroup>
+
+## Event Processing Flow
+
+<Steps>
+  <Step title="Signature Verification">
+    Verifies the HMAC-SHA256 signature using the per-repo webhook secret.
+  </Step>
+  
+  <Step title="Event Type Detection">
+    Determines event type from payload structure (`pull_request`, `issue`, `push`).
+  </Step>
+  
+  <Step title="Deduplication">
+    Checks for pending/processing events for the same PR within the last hour to avoid duplicate reviews.
+  </Step>
+  
+  <Step title="Event Creation">
+    Creates an `Event` record in the database with status `pending`.
+  </Step>
+  
+  <Step title="Background Processing">
+    For PR events (`opened` or `synchronize` actions), updates status to `processing` and queues a background task.
+  </Step>
+  
+  <Step title="Immediate Response">
+    Returns HTTP 200 to GitHub within milliseconds.
+  </Step>
+</Steps>
+
+### Background Review Process
+
+After responding to GitHub, Nectr processes the PR review asynchronously:
+
+1. **Fetch PR Data** — Uses GitHub REST API to get diff, files, and file contents
+2. **Pull MCP Context** — Optionally fetches linked issues (Linear), errors (Sentry), and messages (Slack)
+3. **Build Review Context** — Queries Neo4j for file experts and related PRs; queries Mem0 for project patterns
+4. **AI Analysis** — Sends context to Claude Sonnet 4.6 for review (standard or parallel agent mode)
+5. **Post Review** — Posts the review as a GitHub comment using the user's OAuth token
+6. **Index in Neo4j** — Creates PullRequest, Developer, and File nodes with relationships
+7. **Extract Memories** — Stores patterns and insights in Mem0 for future reviews
+8. **Update Event Status** — Marks event as `completed` or `failed`
+
+## Error Responses
+
+<ResponseField name="status_code" type="number" required>
+  HTTP status code
+</ResponseField>
+
+<ResponseField name="detail" type="string" required>
+  Error message
+</ResponseField>
+
+<CodeGroup>
+```json 403 Forbidden
+{
+  "detail": "Invalid webhook signature"
+}
+```
+
+```json 500 Internal Server Error
+{
+  "detail": "Internal server error"
+}
+```
+</CodeGroup>
+
+## Webhook Configuration
+
+When connecting a repository through Nectr's UI, the webhook is automatically configured with:
+
+- **Payload URL**: `https://your-backend.up.railway.app/api/v1/webhooks/github`
+- **Content type**: `application/json`
+- **Secret**: Auto-generated and stored in the database
+- **Events**: `Pull requests` only
+- **Active**: `true`
+
+## Supported Event Types
+
+| Event Type | Actions | Behavior |
+|------------|---------|----------|
+| `pull_request` | `opened`, `synchronize` | Triggers AI review |
+| `pull_request` | Other actions | Logged, no review |
+| `issues` | All | Logged, no review |
+| `push` | All | Logged, no review |
+
+<Warning>
+Only `pull_request` events with `opened` or `synchronize` actions trigger AI reviews. All other events are logged but not processed.
+</Warning>
+
+## Rate Limiting
+
+Nectr implements automatic deduplication to prevent duplicate reviews:
+
+- Checks for existing `pending` or `processing` events for the same PR
+- Scope: Last 1 hour
+- Match criteria: Same PR number + same repository full name
+- Result: Returns `200 OK` with `duplicate_skipped` status
+
+## Source Code
+
+The webhook implementation is located at:
+
+```
+app/api/v1/webhooks.py:96
+```
+
+Key functions:
+- `verify_github_signature()` — HMAC-SHA256 verification (line 24)
+- `process_pr_in_background()` — Async review processor (line 41)
+- `github_webhook()` — Main endpoint handler (line 96)

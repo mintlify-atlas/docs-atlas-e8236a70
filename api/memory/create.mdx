@@ -1,0 +1,284 @@
+---
+title: 'Create Memory'
+api: 'POST /api/v1/memory'
+description: 'Manually add a new AI memory to a repository'
+---
+
+## Overview
+
+Create a new memory entry for a repository. This allows you to manually add project rules, guidelines, or context that the AI should consider during code reviews.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+## Request Body
+
+<ParamField body="repo" type="string" required>
+  Repository in `owner/repo` format (e.g., "acme/api-server")
+</ParamField>
+
+<ParamField body="content" type="string" required>
+  Memory content - clear, descriptive text about the rule, pattern, or context
+</ParamField>
+
+<ParamField body="memory_type" type="string" default="project_rule">
+  Type of memory to create. Valid values:
+  - `project_rule`: Project-specific guidelines and standards
+  - `architecture`: System architecture and design decisions
+  - `project_map`: Codebase structure descriptions
+</ParamField>
+
+## Response
+
+<ResponseField name="id" type="string">
+  Unique ID of the created memory
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Status of the operation ("added")
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST "https://api.nectr.ai/api/v1/memory" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo": "acme/api-server",
+    "content": "All API endpoints must include rate limiting with redis-based token bucket algorithm. Default: 100 requests per minute per user.",
+    "memory_type": "project_rule"
+  }'
+```
+
+```python Python
+import requests
+
+response = requests.post(
+    "https://api.nectr.ai/api/v1/memory",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    },
+    json={
+        "repo": "acme/api-server",
+        "content": "All API endpoints must include rate limiting with redis-based token bucket algorithm. Default: 100 requests per minute per user.",
+        "memory_type": "project_rule"
+    }
+)
+
+result = response.json()
+print(f"Memory created with ID: {result['id']}")
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://api.nectr.ai/api/v1/memory',
+  {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      repo: 'acme/api-server',
+      content: 'All API endpoints must include rate limiting with redis-based token bucket algorithm. Default: 100 requests per minute per user.',
+      memory_type: 'project_rule'
+    })
+  }
+);
+
+const result = await response.json();
+console.log(`Memory created with ID: ${result.id}`);
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "id": "mem_a1b2c3d4e5f6",
+  "status": "added"
+}
+```
+
+## Error Responses
+
+### Repository Not Connected
+
+```json
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+HTTP Status: `403 Forbidden`
+
+### Memory Layer Not Available
+
+```json
+{
+  "detail": "Memory layer not configured"
+}
+```
+
+HTTP Status: `503 Service Unavailable`
+
+### Validation Error
+
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "content"],
+      "msg": "field required",
+      "type": "value_error.missing"
+    }
+  ]
+}
+```
+
+HTTP Status: `422 Unprocessable Entity`
+
+## Best Practices
+
+### Writing Effective Memories
+
+**Good:**
+```json
+{
+  "content": "All database migrations must be reversible. Include both upgrade() and downgrade() functions. Never modify existing migrations - create a new one instead.",
+  "memory_type": "project_rule"
+}
+```
+
+**Bad:**
+```json
+{
+  "content": "migrations",
+  "memory_type": "project_rule"
+}
+```
+
+### Memory Content Guidelines
+
+1. **Be Specific**: Include concrete details and examples
+2. **Be Actionable**: Describe what should be done, not just what to avoid
+3. **Provide Context**: Explain why the rule exists when relevant
+4. **Use Clear Language**: Avoid jargon unless it's well-established in your team
+5. **Keep it Focused**: One rule or concept per memory
+
+## Use Cases
+
+### Add Security Requirements
+
+```python
+security_rules = [
+    "All user inputs must be validated and sanitized before database operations. Use Pydantic models for request validation.",
+    "Authentication tokens must expire after 15 minutes. Implement refresh token rotation.",
+    "All API endpoints handling sensitive data must use HTTPS only. No exceptions.",
+    "SQL queries must use parameterized statements. Never use string concatenation."
+]
+
+for rule in security_rules:
+    create_memory(
+        repo="acme/api-server",
+        content=rule,
+        memory_type="project_rule"
+    )
+    print(f"✅ Added: {rule[:60]}...")
+```
+
+### Document Architecture Decisions
+
+```python
+create_memory(
+    repo="acme/api-server",
+    content="We use a microservices architecture with the following services: auth-service (JWT), user-service (profiles), payment-service (Stripe). Each service has its own PostgreSQL database. Inter-service communication uses RabbitMQ for async operations and REST for synchronous calls.",
+    memory_type="architecture"
+)
+```
+
+### Add Testing Standards
+
+```python
+testing_rules = [
+    "All new features must include unit tests with >80% coverage. Use pytest for backend, Jest for frontend.",
+    "Integration tests must be isolated and use test databases. Never test against production data.",
+    "End-to-end tests should cover critical user flows: signup, login, payment, core features."
+]
+
+for rule in testing_rules:
+    create_memory(
+        repo="acme/web-app",
+        content=rule,
+        memory_type="project_rule"
+    )
+```
+
+### Import Team Guidelines
+
+```python
+import yaml
+
+# Load from team's existing documentation
+with open('team_guidelines.yaml') as f:
+    guidelines = yaml.safe_load(f)
+
+for category, rules in guidelines.items():
+    for rule in rules:
+        create_memory(
+            repo="acme/api-server",
+            content=f"{category}: {rule}",
+            memory_type="project_rule"
+        )
+```
+
+### Bulk Import from README
+
+```python
+import re
+
+def extract_rules_from_markdown(md_text):
+    """Extract bullet points from markdown as individual rules."""
+    # Find sections like "## Coding Standards"
+    pattern = r'^##\s+(.+?)\n((?:[-*]\s+.+?\n)+)'
+    matches = re.findall(pattern, md_text, re.MULTILINE)
+    
+    rules = []
+    for section, content in matches:
+        for line in content.split('\n'):
+            if line.strip().startswith(('-', '*')):
+                rule = line.strip()[2:].strip()
+                if rule:
+                    rules.append((section, rule))
+    return rules
+
+with open('README.md') as f:
+    readme = f.read()
+
+rules = extract_rules_from_markdown(readme)
+for section, rule in rules:
+    create_memory(
+        repo="acme/api-server",
+        content=f"[{section}] {rule}",
+        memory_type="project_rule"
+    )
+    print(f"✅ Imported: {rule[:60]}...")
+```
+
+## Notes
+
+- Only `project_rule`, `architecture`, and `project_map` memory types can be manually created
+- Developer-specific memories (`contributor_profile`, `developer_pattern`, `developer_strength`) are automatically learned from PR analysis
+- Memories are immediately available for use in future code reviews
+- You must have the repository connected to your account to create memories
+- Duplicate content is allowed - Mem0 will handle deduplication automatically

@@ -1,0 +1,397 @@
+---
+title: 'Get Project Map'
+api: 'GET /api/v1/memory/project-map'
+description: 'Retrieve comprehensive project structure and codebase overview'
+---
+
+## Overview
+
+Get a structured map of the project's codebase, including directory organization, module descriptions, and architectural overview. This endpoint is optimized for onboarding new developers and providing context to AI code reviewers.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+## Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository to query in `owner/repo` format (e.g., "acme/api-server")
+</ParamField>
+
+## Response
+
+<ResponseField name="memories" type="array">
+  Array of project map memory objects describing codebase structure
+</ResponseField>
+
+<ResponseField name="memories[].id" type="string">
+  Unique memory ID
+</ResponseField>
+
+<ResponseField name="memories[].memory" type="string">
+  Description of a specific part of the codebase (directory, module, or file)
+</ResponseField>
+
+<ResponseField name="memories[].metadata" type="object">
+  Metadata about the memory
+</ResponseField>
+
+<ResponseField name="memories[].metadata.memory_type" type="string">
+  Always "project_map" for this endpoint
+</ResponseField>
+
+<ResponseField name="memories[].metadata.path" type="string">
+  File or directory path being described
+</ResponseField>
+
+<ResponseField name="memories[].metadata.component_type" type="string">
+  Type of component: "directory", "module", "service", "api", "model", etc.
+</ResponseField>
+
+<ResponseField name="count" type="integer">
+  Total number of project map entries
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X GET "https://api.nectr.ai/api/v1/memory/project-map?repo=acme/api-server" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import requests
+
+response = requests.get(
+    "https://api.nectr.ai/api/v1/memory/project-map",
+    headers={"Authorization": f"Bearer {token}"},
+    params={"repo": "acme/api-server"}
+)
+
+data = response.json()
+print(f"Project has {data['count']} documented components\n")
+
+for memory in data['memories'][:10]:
+    path = memory['metadata'].get('path', 'Unknown')
+    print(f"📁 {path}")
+    print(f"   {memory['memory']}\n")
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://api.nectr.ai/api/v1/memory/project-map?repo=acme/api-server',
+  {
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  }
+);
+
+const data = await response.json();
+console.log(`Project has ${data.count} documented components`);
+
+data.memories.slice(0, 10).forEach(memory => {
+  console.log(`📁 ${memory.metadata.path}`);
+  console.log(`   ${memory.memory}`);
+});
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "memories": [
+    {
+      "id": "mem_proj_001",
+      "memory": "Main application module containing FastAPI app initialization, middleware configuration, and route registration.",
+      "metadata": {
+        "memory_type": "project_map",
+        "path": "app/main.py",
+        "component_type": "module",
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_proj_002",
+      "memory": "API v1 endpoints organized by resource type. Contains routes for users, reviews, analytics, and memory management.",
+      "metadata": {
+        "memory_type": "project_map",
+        "path": "app/api/v1/",
+        "component_type": "directory",
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_proj_003",
+      "memory": "SQLAlchemy models defining database schema. Includes Event, WorkflowRun, Installation, and User models.",
+      "metadata": {
+        "memory_type": "project_map",
+        "path": "app/models/",
+        "component_type": "directory",
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_proj_004",
+      "memory": "Database configuration and session management. Implements async SQLAlchemy engine with connection pooling.",
+      "metadata": {
+        "memory_type": "project_map",
+        "path": "app/core/database.py",
+        "component_type": "module",
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_proj_005",
+      "memory": "GitHub API client wrapper providing methods for PR data retrieval, repository stats, and webhook processing.",
+      "metadata": {
+        "memory_type": "project_map",
+        "path": "app/integrations/github/",
+        "component_type": "service",
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_proj_006",
+      "memory": "Mem0 memory adapter service for storing and retrieving AI-learned context about the codebase and contributors.",
+      "metadata": {
+        "memory_type": "project_map",
+        "path": "app/services/memory_adapter.py",
+        "component_type": "service",
+        "repo": "acme/api-server"
+      }
+    }
+  ],
+  "count": 6
+}
+```
+
+## Use Cases
+
+### Generate Documentation
+
+```python
+def generate_architecture_docs(repo):
+    """Generate markdown documentation from project map."""
+    data = get_project_map(repo=repo)
+    
+    # Group by directory
+    by_path = {}
+    for memory in data['memories']:
+        path = memory['metadata'].get('path', 'Unknown')
+        by_path[path] = memory
+    
+    # Generate markdown
+    docs = f"# {repo} - Architecture Overview\n\n"
+    docs += f"This project has {data['count']} documented components.\n\n"
+    
+    # Sort by path for logical organization
+    for path in sorted(by_path.keys()):
+        memory = by_path[path]
+        component_type = memory['metadata'].get('component_type', 'component')
+        icon = '📁' if component_type == 'directory' else '📄'
+        
+        docs += f"## {icon} `{path}`\n\n"
+        docs += f"{memory['memory']}\n\n"
+    
+    return docs
+
+# Save to file
+with open('ARCHITECTURE.md', 'w') as f:
+    f.write(generate_architecture_docs('acme/api-server'))
+```
+
+### Developer Onboarding
+
+```python
+def generate_onboarding_guide(repo):
+    """Create an interactive onboarding guide for new developers."""
+    project_map = get_project_map(repo=repo)
+    
+    print(f"Welcome to {repo}! Let's explore the codebase.\n")
+    
+    # Core modules first
+    core_components = [m for m in project_map['memories'] 
+                      if 'main' in m['metadata'].get('path', '').lower() 
+                      or 'core' in m['metadata'].get('path', '').lower()]
+    
+    print("📍 Core Components:")
+    for comp in core_components:
+        print(f"  • {comp['metadata'].get('path')}")
+        print(f"    {comp['memory']}\n")
+    
+    # API endpoints
+    api_components = [m for m in project_map['memories']
+                     if 'api' in m['metadata'].get('path', '').lower()]
+    
+    print("🌐 API Endpoints:")
+    for comp in api_components:
+        print(f"  • {comp['metadata'].get('path')}")
+        print(f"    {comp['memory']}\n")
+    
+    # Services
+    services = [m for m in project_map['memories']
+               if 'service' in m['metadata'].get('component_type', '')]
+    
+    print("⚙️ Services:")
+    for svc in services:
+        print(f"  • {svc['metadata'].get('path')}")
+        print(f"    {svc['memory']}\n")
+```
+
+### AI Code Review Context
+
+```python
+def build_review_context(repo, changed_files):
+    """
+    Build relevant context for AI reviewer based on changed files.
+    
+    Args:
+        repo: Repository name
+        changed_files: List of file paths modified in the PR
+    """
+    project_map = get_project_map(repo=repo)
+    
+    # Find relevant project map entries
+    relevant_context = []
+    for memory in project_map['memories']:
+        path = memory['metadata'].get('path', '')
+        
+        # Check if any changed file is in this path
+        if any(path in changed_file or changed_file.startswith(path) 
+               for changed_file in changed_files):
+            relevant_context.append(memory)
+    
+    # Build context string
+    context = "## Relevant Project Context\n\n"
+    for memory in relevant_context:
+        context += f"**{memory['metadata'].get('path')}**: {memory['memory']}\n\n"
+    
+    return context
+
+# Example usage
+changed_files = ['app/api/v1/reviews.py', 'app/models/event.py']
+context = build_review_context('acme/api-server', changed_files)
+print(context)
+```
+
+### Search Project Structure
+
+```python
+def search_project_map(repo, query):
+    """Search project map for specific components or functionality."""
+    data = get_project_map(repo=repo)
+    
+    results = []
+    query_lower = query.lower()
+    
+    for memory in data['memories']:
+        path = memory['metadata'].get('path', '').lower()
+        description = memory['memory'].lower()
+        
+        if query_lower in path or query_lower in description:
+            results.append(memory)
+    
+    return results
+
+# Find all authentication-related components
+auth_components = search_project_map('acme/api-server', 'auth')
+print(f"Found {len(auth_components)} authentication-related components:\n")
+
+for comp in auth_components:
+    print(f"📍 {comp['metadata'].get('path')}")
+    print(f"   {comp['memory']}\n")
+```
+
+### Generate Codebase Graph
+
+```python
+import networkx as nx
+import matplotlib.pyplot as plt
+
+def visualize_codebase_structure(repo):
+    """Create a visual graph of the codebase structure."""
+    data = get_project_map(repo=repo)
+    
+    G = nx.DiGraph()
+    
+    for memory in data['memories']:
+        path = memory['metadata'].get('path', '')
+        component_type = memory['metadata'].get('component_type', 'module')
+        
+        # Add node
+        G.add_node(path, type=component_type)
+        
+        # Add edge from parent directory
+        if '/' in path:
+            parent = path.rsplit('/', 1)[0] + '/'
+            if parent != path:
+                G.add_edge(parent, path)
+    
+    # Draw graph
+    plt.figure(figsize=(16, 12))
+    pos = nx.spring_layout(G, k=2, iterations=50)
+    
+    # Color by component type
+    colors = {
+        'directory': 'lightblue',
+        'module': 'lightgreen',
+        'service': 'orange',
+        'api': 'pink'
+    }
+    node_colors = [colors.get(G.nodes[n].get('type', 'module'), 'gray') 
+                   for n in G.nodes()]
+    
+    nx.draw(G, pos, node_color=node_colors, with_labels=True, 
+            node_size=3000, font_size=8, arrows=True)
+    plt.title(f"{repo} - Codebase Structure")
+    plt.savefig('codebase_structure.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved visualization to codebase_structure.png")
+```
+
+## Triggering Project Map Generation
+
+The project map is automatically generated when you connect a repository. To update it:
+
+```python
+# Trigger a rescan to update the project map
+response = requests.post(
+    "https://api.nectr.ai/api/v1/memory/rescan",
+    headers={"Authorization": f"Bearer {token}"},
+    params={"repo": "acme/api-server"}
+)
+
+print(f"Status: {response.json()['status']}")
+# Output: Status: rescan_started
+
+# Wait a few minutes, then fetch the updated project map
+time.sleep(180)
+project_map = get_project_map(repo="acme/api-server")
+```
+
+## Error Responses
+
+### Repository Not Connected
+
+```json
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+HTTP Status: `403 Forbidden`
+
+## Notes
+
+- The project map is built by analyzing repository structure, README files, and code patterns
+- It's automatically updated when significant changes are detected through PR reviews
+- Use the `/memory/rescan` endpoint to manually trigger a full project scan
+- Empty repositories or those without PR activity may have limited project map data

@@ -1,0 +1,377 @@
+---
+title: Feature Flags
+description: Configure optional features and behavioral toggles in Nectr
+---
+
+Nectr uses feature flags to enable experimental features and customize review behavior. All feature flags are configured via environment variables.
+
+## Available Feature Flags
+
+### Parallel Review Agents
+
+<ParamField path="PARALLEL_REVIEW_AGENTS" type="boolean" default="false">
+  Enable parallel review mode with 3 specialized agents running concurrently.
+  
+  ```bash
+  PARALLEL_REVIEW_AGENTS=false  # Default: single agentic loop
+  PARALLEL_REVIEW_AGENTS=true   # Enable: 3 parallel agents
+  ```
+</ParamField>
+
+---
+
+## Parallel Review Agents
+
+By default, Nectr uses a single agentic review loop where Claude iteratively fetches context using MCP-style tools. When `PARALLEL_REVIEW_AGENTS=true`, Nectr switches to a parallel architecture with three specialized agents.
+
+### Architecture Comparison
+
+<Accordion title="Standard Mode (Default)">
+  **Single Agentic Loop**
+  
+  ```
+  ┌─────────────────────────────────────────────┐
+  │         Claude Sonnet 4.5 Agent             │
+  │  ┌───────────────────────────────────────┐  │
+  │  │  Agentic Loop with 8 Tools:           │  │
+  │  │  • read_file                           │  │
+  │  │  • search_project_memory               │  │
+  │  │  • search_developer_memory             │  │
+  │  │  • get_file_history                    │  │
+  │  │  • get_issue_details                   │  │
+  │  │  • search_open_issues                  │  │
+  │  │  • get_linked_issues (Linear/GitHub)   │  │
+  │  │  • get_related_errors (Sentry)         │  │
+  │  └───────────────────────────────────────┘  │
+  │                                             │
+  │  Claude decides what context to fetch       │
+  │  based on the PR contents                   │
+  └─────────────────────────────────────────────┘
+                    ↓
+           Single Review Output
+  ```
+  
+  **Characteristics:**
+  - ✅ Faster for small PRs (1 API call)
+  - ✅ Lower token usage
+  - ✅ More efficient context fetching (only what's needed)
+  - ✅ Better for budget-conscious deployments
+  - ❌ Single perspective on code review
+</Accordion>
+
+<Accordion title="Parallel Mode">
+  **Three Specialized Agents + Synthesis**
+  
+  ```
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │  Security Agent  │  │ Performance Agent│  │   Style Agent    │
+  │                  │  │                  │  │                  │
+  │  • Auth/authz    │  │  • Database      │  │  • Code patterns │
+  │  • Input valid.  │  │  • Caching       │  │  • Readability   │
+  │  • XSS/injection │  │  • N+1 queries   │  │  • Best practices│
+  │  • Dependencies  │  │  • Memory leaks  │  │  • Consistency   │
+  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+           │                     │                     │
+           └──────────────┬──────┴─────────────────────┘
+                          ↓
+                ┌──────────────────────┐
+                │  Synthesis Agent     │
+                │  Combines all three  │
+                │  into final review   │
+                └──────────────────────┘
+                          ↓
+                 Final Review Output
+  ```
+  
+  **Characteristics:**
+  - ✅ More thorough analysis (3 specialized perspectives)
+  - ✅ Can be faster for large PRs (parallel execution)
+  - ✅ Better at catching domain-specific issues
+  - ✅ More comprehensive coverage
+  - ❌ 4x API calls (higher cost)
+  - ❌ Higher token usage
+  - ❌ Overkill for small PRs
+</Accordion>
+
+### How It Works
+
+<Steps>
+  <Step title="Check Feature Flag">
+    The PR review service checks the feature flag:
+    
+    ```python
+    # app/services/pr_review_service.py:559
+    use_parallel = getattr(settings, 'PARALLEL_REVIEW_AGENTS', False)
+    ```
+  </Step>
+  
+  <Step title="Choose Review Mode">
+    Based on the flag, Nectr routes to the appropriate review function:
+    
+    ```python
+    # app/services/pr_review_service.py:560-569
+    if use_parallel:
+        logger.info("Starting parallel AI analysis (3 specialized agents concurrently)...")
+        review_result = await ai_service.analyze_pull_request_parallel(
+            pr, diff, files, tool_executor, issue_refs=issue_refs
+        )
+    else:
+        logger.info("Starting agentic AI analysis (Claude fetches context on demand)...")
+        review_result = await ai_service.analyze_pull_request_agentic(
+            pr, diff, files, tool_executor, issue_refs=issue_refs
+        )
+    ```
+  </Step>
+  
+  <Step title="Execute Reviews">
+    **Standard Mode:**
+    ```python
+    # Single agentic loop
+    response = await anthropic.messages.create(
+        model=settings.ANTHROPIC_MODEL,
+        max_tokens=16000,
+        tools=REVIEW_TOOLS,  # 8 MCP-style tools
+        messages=[...],
+    )
+    
+    # Process tool calls in a loop until Claude is satisfied
+    while response.stop_reason == "tool_use":
+        # Execute tools and continue conversation
+        ...
+    ```
+    
+    **Parallel Mode:**
+    ```python
+    # Run 3 agents concurrently
+    security_review, performance_review, style_review = await asyncio.gather(
+        analyze_security(pr, diff, files),
+        analyze_performance(pr, diff, files),
+        analyze_style(pr, diff, files),
+    )
+    
+    # Synthesize into final review
+    final_review = await synthesize_reviews(
+        security_review,
+        performance_review,
+        style_review,
+    )
+    ```
+  </Step>
+  
+  <Step title="Return Review Result">
+    Both modes return the same `ReviewResult` structure:
+    
+    ```python
+    @dataclass
+    class ReviewResult:
+        summary: str                      # Markdown review summary
+        verdict: str                      # APPROVE / REQUEST_CHANGES / NEEDS_DISCUSSION
+        inline_comments: list[dict]       # Inline suggestions with line hints
+        semantic_issue_matches: list[dict] # Issues this PR might resolve
+    ```
+  </Step>
+</Steps>
+
+### When to Use Parallel Mode
+
+<Accordion title="✅ Good Use Cases">
+  - **Large PRs** (>10 files or >500 lines changed)
+    - Parallel execution can be faster
+    - More thorough analysis justifies extra cost
+  
+  - **Security-critical codebases**
+    - Dedicated security agent catches more vulnerabilities
+    - Authentication, authorization, input validation get focused review
+  
+  - **Performance-sensitive applications**
+    - Dedicated performance agent analyzes database queries, caching, algorithms
+    - Better at identifying N+1 queries and memory leaks
+  
+  - **Team projects with strict style guides**
+    - Style agent enforces consistency across codebase
+    - Catches pattern violations and readability issues
+  
+  - **High-stakes reviews**
+    - Production deployments
+    - Public API changes
+    - Database migrations
+</Accordion>
+
+<Accordion title="❌ Avoid for">
+  - **Small PRs** (&lt;5 files, &lt;200 lines)
+    - Overkill for minor changes
+    - Standard mode is faster and cheaper
+  
+  - **Documentation-only changes**
+    - No code to analyze
+    - Parallel agents provide no extra value
+  
+  - **Budget-constrained projects**
+    - 4x Claude API calls = 4x cost
+    - Standard mode is sufficient for most PRs
+  
+  - **High-volume repositories**
+    - Many PRs per day = high cost multiplier
+    - Consider enabling only for specific branches or file patterns
+</Accordion>
+
+### Cost Comparison
+
+Assuming Claude Sonnet 4.5 pricing (as of March 2026):
+
+| Mode | API Calls | Avg Tokens | Approx Cost per Review |
+|------|-----------|------------|------------------------|
+| Standard | 1 main call + tool iterations | 8k-15k | $0.04 - $0.08 |
+| Parallel | 4 calls (3 agents + synthesis) | 20k-40k | $0.15 - $0.30 |
+
+**Monthly cost estimate** (100 PRs/month):
+- Standard: ~$6/month
+- Parallel: ~$22/month
+
+<Warning>
+  Actual costs depend on PR size, number of tool calls, and model pricing. Monitor your Anthropic API usage dashboard.
+</Warning>
+
+---
+
+## Configuring Feature Flags
+
+### Via Environment Variables
+
+```bash
+# .env
+PARALLEL_REVIEW_AGENTS=false  # or true
+```
+
+### Via Settings Class
+
+Feature flags are defined in the settings class:
+
+```python
+# app/core/config.py:52-53
+class Settings(BaseSettings):
+    # ...
+    PARALLEL_REVIEW_AGENTS: bool = False  # Set to True to use 3 parallel specialized agents
+    # ...
+```
+
+The default value is `False` if the environment variable is not set.
+
+### Runtime Changes
+
+<Warning>
+  Feature flags are read at **runtime** on each PR review. You can change them without restarting the server.
+  
+  However, the behavior is determined when the review **starts**, so in-progress reviews won't be affected.
+</Warning>
+
+To change feature flags:
+
+1. Update `.env` file
+2. If using Railway/Heroku/etc, update environment variables in the platform dashboard
+3. Changes take effect immediately for new webhook events
+
+---
+
+## Experimental Features (Planned)
+
+The following feature flags are planned for future releases:
+
+<Accordion title="ENABLE_SLACK_NOTIFICATIONS">
+  **Status:** Planned
+  
+  Send Slack notifications when reviews are posted.
+  
+  ```bash
+  ENABLE_SLACK_NOTIFICATIONS=true
+  SLACK_CHANNEL_ID=C1234567890
+  ```
+</Accordion>
+
+<Accordion title="ENABLE_LINEAR_SYNC">
+  **Status:** Planned
+  
+  Automatically update Linear issues when PRs are merged.
+  
+  ```bash
+  ENABLE_LINEAR_SYNC=true
+  ```
+</Accordion>
+
+<Accordion title="AUTO_APPROVE_SAFE_PRS">
+  **Status:** Planned
+  
+  Automatically approve PRs that pass all checks and have no issues.
+  
+  ```bash
+  AUTO_APPROVE_SAFE_PRS=false  # Disabled by default for safety
+  ```
+</Accordion>
+
+<Accordion title="ENABLE_REVIEW_CACHING">
+  **Status:** Planned
+  
+  Cache review results for identical diffs to save API costs.
+  
+  ```bash
+  ENABLE_REVIEW_CACHING=true
+  CACHE_TTL_HOURS=24
+  ```
+</Accordion>
+
+---
+
+## Debugging Feature Flags
+
+### Check Current Settings
+
+View active feature flags via the health endpoint:
+
+```bash
+curl http://localhost:8000/health
+```
+
+**Expected response:**
+```json
+{
+  "status": "healthy",
+  "settings": {
+    "parallel_review_agents": false,
+    "anthropic_model": "claude-sonnet-4-5-20250929",
+    "app_env": "development"
+  },
+  "database": "connected",
+  "neo4j": "connected"
+}
+```
+
+### Check Logs
+
+Feature flags are logged when a review starts:
+
+```bash
+# Standard mode
+INFO: Starting agentic AI analysis (Claude fetches context on demand)...
+
+# Parallel mode
+INFO: Starting parallel AI analysis (3 specialized agents concurrently)...
+```
+
+Search logs for these messages to verify which mode is active:
+
+```bash
+grep -i "Starting.*AI analysis" logs/app.log
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Environment Variables" icon="gear" href="/configuration/environment-variables">
+    View all configuration options
+  </Card>
+  <Card title="Webhooks" icon="webhook" href="/configuration/webhooks">
+    Learn how PR events trigger reviews
+  </Card>
+</CardGroup>

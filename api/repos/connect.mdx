@@ -1,0 +1,192 @@
+---
+title: "Connect Repository"
+api: "POST /api/v1/repos/{owner}/{repo}/install"
+description: "Connect a GitHub repository to enable AI-powered PR reviews"
+---
+
+## Overview
+
+Connects a repository to Nectr AI by installing a webhook and initiating background tasks to scan the repository structure and build a code knowledge graph.
+
+This is a one-click operation that uses the user's existing OAuth token (with `repo` scope) - no GitHub redirect required.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header.
+
+```
+Authorization: Bearer <token>
+```
+
+## Path Parameters
+
+<ParamField path="owner" type="string" required>
+  Repository owner (user or organization)
+</ParamField>
+
+<ParamField path="repo" type="string" required>
+  Repository name
+</ParamField>
+
+## Request
+
+<CodeGroup>
+```bash cURL
+curl -X POST "https://api.nectr.ai/api/v1/repos/acme/my-backend/install" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import httpx
+
+headers = {
+    "Authorization": "Bearer YOUR_JWT_TOKEN"
+}
+
+response = httpx.post(
+    "https://api.nectr.ai/api/v1/repos/acme/my-backend/install",
+    headers=headers
+)
+result = response.json()
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://api.nectr.ai/api/v1/repos/acme/my-backend/install',
+  {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer YOUR_JWT_TOKEN'
+    }
+  }
+);
+
+const result = await response.json();
+```
+</CodeGroup>
+
+## Response
+
+<ResponseField name="status" type="string">
+  Always returns `"connected"` on success
+</ResponseField>
+
+<ResponseField name="installation_id" type="integer">
+  Database ID of the newly created installation record
+</ResponseField>
+
+<ResponseField name="repo" type="string">
+  Full repository name in `owner/repo` format
+</ResponseField>
+
+### Example Response
+
+```json
+{
+  "status": "connected",
+  "installation_id": 42,
+  "repo": "acme/my-backend"
+}
+```
+
+## What Happens During Connection
+
+### 1. Webhook Installation
+
+A GitHub webhook is created on the repository with:
+- **Events**: `pull_request`, `issues`
+- **Payload URL**: `{BACKEND_URL}/api/v1/webhooks/github`
+- **Secret**: Randomly generated 64-character hex string
+- **Content type**: JSON
+
+The webhook ID and secret are stored in the `Installation` record for later verification and cleanup.
+
+### 2. Database Record Creation
+
+An `Installation` record is persisted with:
+```python
+{
+  "user_id": current_user.id,
+  "repo_full_name": "owner/repo",
+  "webhook_id": 123456,
+  "webhook_secret": "...",
+  "is_active": True
+}
+```
+
+### 3. Background Tasks (Async)
+
+Two tasks are queued in the background:
+
+**Project Scanner** (`scan_repo`):
+- Fetches the repository file tree from GitHub
+- Analyzes project structure and dependencies
+- Identifies language, framework, and key files
+
+**Graph Builder** (`build_repo_graph`):
+- Creates a Neo4j knowledge graph of the codebase
+- Indexes files with language and size metadata
+- Establishes `Repository` -[:CONTAINS]-> `File` relationships
+
+These tasks run asynchronously and do not block the response.
+
+## Error Responses
+
+<ResponseField name="400 Bad Request">
+  Repository is already connected
+  
+  ```json
+  {
+    "detail": "Repo already connected"
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="401 Unauthorized">
+  JWT token is invalid, expired, or missing
+  
+  ```json
+  {
+    "detail": "Unauthorized"
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="401 Session Expired">
+  GitHub OAuth token cannot be decrypted (SECRET_KEY changed)
+  
+  ```json
+  {
+    "detail": "Session expired — please log out and sign in again."
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="502 Bad Gateway">
+  Failed to install webhook on GitHub
+  
+  ```json
+  {
+    "detail": "Failed to install webhook: {error_message}"
+  }
+  ```
+  
+  Common causes:
+  - User lacks admin permissions on the repository
+  - OAuth token missing `repo` scope
+  - GitHub API is unavailable
+</ResponseField>
+
+## Permissions Required
+
+### GitHub OAuth Scopes
+- `repo` - Required to create webhooks and access repository contents
+
+### Repository Access
+The authenticated user must have **admin** permissions on the repository to install webhooks.
+
+## Related Endpoints
+
+- [List Repositories](/api/repos/list) - View all repositories with connection status
+- [Disconnect Repository](/api/repos/disconnect) - Remove webhook and deactivate connection
+- [Rescan Repository](/api/repos/rescan) - Rebuild the code knowledge graph

@@ -1,0 +1,619 @@
+---
+title: "Slack Integration"
+description: "Include relevant team messages and discussions in PR review context via MCP"
+---
+
+## Overview
+
+The Slack integration allows Nectr to pull relevant team messages during PR reviews. When reviewing a PR, Nectr can query Slack for:
+
+- Discussions about the feature being implemented
+- Design decisions made in team channels
+- Questions or concerns raised by team members
+- Context about why certain changes are needed
+
+This helps ground PR reviews in the actual team conversation, ensuring the implementation aligns with what was discussed.
+
+<Note>
+  This is an **inbound MCP integration** — Nectr acts as an MCP client connecting to a Slack MCP server.
+</Note>
+
+## How It Works
+
+<Steps>
+  <Step title="PR references feature or discussion">
+    Developer submits a PR with title: "Add rate limiting as discussed in #eng-infra"
+  </Step>
+  
+  <Step title="Nectr extracts search keywords">
+    During PR review, Nectr parses PR title, description, and changed files to identify relevant search terms
+  </Step>
+  
+  <Step title="MCP query to Slack">
+    Nectr calls the Slack MCP server to search for messages:
+    ```python
+    slack_messages = await mcp_client.get_slack_messages(
+        channel="eng-infra",
+        query="rate limiting",
+    )
+    ```
+  </Step>
+  
+  <Step title="Context included in review">
+    Slack messages are injected into the AI review prompt:
+    ```
+    SLACK CONTEXT:
+    #eng-infra (2 days ago) - @alice:
+    "We should add rate limiting to the auth endpoints. 100 req/min per IP."
+    
+    #eng-infra (2 days ago) - @bob:
+    "Agreed. Use Redis for tracking, it's already deployed."
+    ```
+  </Step>
+  
+  <Step title="AI review validates against team decisions">
+    Claude can now verify:
+    - Does the PR implement what the team discussed?
+    - Are there gaps between the Slack discussion and implementation?
+    - Should the PR address additional points raised in Slack?
+  </Step>
+</Steps>
+
+## Setup
+
+### 1. Create Slack App
+
+<Steps>
+  <Step title="Go to Slack API portal">
+    Navigate to [api.slack.com/apps](https://api.slack.com/apps)
+  </Step>
+  
+  <Step title="Create new app">
+    Click "Create New App" → "From scratch"
+    - App Name: "Nectr MCP"
+    - Workspace: Select your workspace
+  </Step>
+  
+  <Step title="Add OAuth scopes">
+    Go to **OAuth & Permissions** → **Bot Token Scopes**
+    
+    Required scopes:
+    - `channels:history` - Read public channel messages
+    - `channels:read` - View basic channel information
+    - `search:read` - Search workspace messages
+    - `users:read` - View user information (for @mentions)
+  </Step>
+  
+  <Step title="Install app to workspace">
+    Click **Install to Workspace** and authorize
+  </Step>
+  
+  <Step title="Copy Bot User OAuth Token">
+    Copy the token starting with `xoxb-`
+  </Step>
+</Steps>
+
+### 2. Deploy Slack MCP Server
+
+You need a Slack MCP server running separately from Nectr.
+
+**Build your own Slack MCP server:**
+
+```python
+# slack_mcp_server.py
+from fastapi import FastAPI
+from mcp.server.fastmcp import FastMCP
+import httpx
+import os
+from datetime import datetime, timedelta
+
+mcp = FastMCP("Slack")
+
+@mcp.tool()
+async def search_messages(
+    channel: str,
+    query: str,
+    days: int = 7,
+) -> list[dict]:
+    """Search recent messages in a Slack channel.
+    
+    Args:
+        channel: Channel name without # (e.g., "eng-infra")
+        query: Search query (keywords, phrases)
+        days: How many days back to search (default 7)
+    
+    Returns:
+        List of messages with text, user, timestamp, permalink
+    """
+    bot_token = os.getenv("SLACK_BOT_TOKEN")
+    if not bot_token:
+        return [{"error": "SLACK_BOT_TOKEN not configured"}]
+    
+    # 1. Find channel ID from name
+    async with httpx.AsyncClient() as client:
+        # List channels
+        resp = await client.get(
+            "https://slack.com/api/conversations.list",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            params={"exclude_archived": True, "types": "public_channel"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if not data.get("ok"):
+            return [{"error": f"Slack API error: {data.get('error')}"}]
+        
+        channels = data.get("channels", [])
+        channel_id = None
+        for ch in channels:
+            if ch.get("name") == channel:
+                channel_id = ch.get("id")
+                break
+        
+        if not channel_id:
+            return [{"error": f"Channel #{channel} not found"}]
+        
+        # 2. Search messages in channel
+        oldest = (datetime.now() - timedelta(days=days)).timestamp()
+        resp = await client.get(
+            "https://slack.com/api/conversations.history",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            params={
+                "channel": channel_id,
+                "oldest": oldest,
+                "limit": 100,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if not data.get("ok"):
+            return [{"error": f"Slack API error: {data.get('error')}"}]
+        
+        messages = data.get("messages", [])
+    
+    # 3. Filter by query (simple text search)
+    query_lower = query.lower()
+    filtered = [
+        msg for msg in messages
+        if "text" in msg and query_lower in msg["text"].lower()
+    ]
+    
+    # 4. Format results
+    results = []
+    for msg in filtered[:10]:  # Limit to 10 most recent
+        user_id = msg.get("user", "unknown")
+        # Fetch user name (cache this in production)
+        user_name = user_id
+        if user_id != "unknown":
+            try:
+                async with httpx.AsyncClient() as client:
+                    user_resp = await client.get(
+                        "https://slack.com/api/users.info",
+                        headers={"Authorization": f"Bearer {bot_token}"},
+                        params={"user": user_id},
+                    )
+                    user_data = user_resp.json()
+                    if user_data.get("ok"):
+                        user_name = user_data.get("user", {}).get("real_name", user_id)
+            except:
+                pass
+        
+        results.append({
+            "text": msg.get("text", ""),
+            "user": user_name,
+            "timestamp": msg.get("ts"),
+            "channel": channel,
+            "permalink": f"https://your-workspace.slack.com/archives/{channel_id}/p{msg.get('ts', '').replace('.', '')}",
+        })
+    
+    return results
+
+app = FastAPI()
+app.mount("/mcp", mcp.sse_app())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8003)
+```
+
+### 3. Configure Nectr
+
+Set environment variables in your Nectr backend:
+
+```env
+# Slack MCP server base URL
+SLACK_MCP_URL=https://your-slack-mcp-server.railway.app
+
+# No auth token needed for MCP call - Slack bot token is stored in MCP server
+```
+
+<Note>
+  Unlike Linear and Sentry integrations, the Slack bot token is stored in the MCP server itself, not passed from Nectr. This simplifies configuration since the bot token has workspace-level access.
+</Note>
+
+## API Reference
+
+### `MCPClientManager` (Slack Support)
+
+The `MCPClientManager` doesn't have a dedicated `get_slack_messages()` method yet. Use the generic `query_mcp_server()` method:
+
+**Source:** `app/mcp/client.py:118`
+
+**Usage:**
+```python
+from app.mcp.client import mcp_client
+from app.core.config import settings
+
+if settings.SLACK_MCP_URL:
+    slack_messages = await mcp_client.query_mcp_server(
+        server_url=settings.SLACK_MCP_URL,
+        tool_name="search_messages",
+        args={
+            "channel": "eng-infra",
+            "query": "rate limiting",
+            "days": 7,
+        },
+        auth_token=None,  # Not needed - bot token in MCP server
+    )
+else:
+    slack_messages = []
+```
+
+**Returns:**
+```python
+[
+    {
+        "text": "We should add rate limiting to the auth endpoints. 100 req/min per IP.",
+        "user": "Alice Johnson",
+        "timestamp": "1710086400.123456",
+        "channel": "eng-infra",
+        "permalink": "https://workspace.slack.com/archives/C01234/p1710086400123456",
+    }
+]
+```
+
+Returns empty list `[]` if:
+- `SLACK_MCP_URL` is not configured
+- Slack MCP server is unreachable
+- MCP call times out (10-second timeout)
+- No messages match the query
+- Channel not found
+
+## Adding a Dedicated Method
+
+For consistency with other integrations, add a dedicated method:
+
+```python
+# Add to app/mcp/client.py:MCPClientManager
+
+async def get_slack_messages(
+    self,
+    channel: str,
+    query: str,
+    days: int = 7,
+) -> list[dict]:
+    """Search recent messages in a Slack channel.
+    
+    Args:
+        channel: Channel name without # (e.g., "eng-infra")
+        query:   Search query (keywords, phrases)
+        days:    How many days back to search (default 7)
+    
+    Returns:
+        List of message dicts: {text, user, timestamp, channel, permalink}
+        Empty list if Slack MCP is not configured or call fails.
+    """
+    if not settings.SLACK_MCP_URL:
+        logger.info(
+            "SLACK_MCP_URL not configured — skipping Slack message fetch"
+        )
+        return []
+
+    return await self.query_mcp_server(
+        server_url=settings.SLACK_MCP_URL,
+        tool_name="search_messages",
+        args={"channel": channel, "query": query, "days": days},
+        auth_token=None,  # Bot token stored in MCP server
+    )
+```
+
+## Usage in PR Review Flow
+
+Here's how Slack context can be pulled during a review:
+
+```python
+# 1. Extract channel references from PR
+import re
+
+SLACK_CHANNEL_PATTERN = re.compile(r"#([a-z0-9-]+)")
+
+pr_text = f"{pr_data['title']} {pr_data['body']}"
+channels = SLACK_CHANNEL_PATTERN.findall(pr_text)
+# Example: "Discussed in #eng-infra" -> ["eng-infra"]
+
+# 2. Build search query from PR metadata
+query_keywords = [
+    pr_data["title"],
+    pr_data.get("body", "")[:100],  # First 100 chars
+]
+query = " ".join(q for q in query_keywords if q).strip()
+
+# 3. Pull Slack messages from referenced channels
+slack_messages = []
+for channel in channels[:2]:  # Limit to 2 channels
+    if settings.SLACK_MCP_URL:
+        messages = await mcp_client.query_mcp_server(
+            server_url=settings.SLACK_MCP_URL,
+            tool_name="search_messages",
+            args={"channel": channel, "query": query, "days": 14},
+        )
+        slack_messages.extend(messages)
+
+# 4. Format Slack context for AI review prompt
+slack_context = ""
+if slack_messages:
+    slack_context = "\n\nSLACK CONTEXT:\n"
+    for msg in slack_messages[:5]:  # Limit to 5 most relevant
+        timestamp = datetime.fromtimestamp(float(msg["timestamp"]))
+        slack_context += f"""#{msg['channel']} ({timestamp.strftime('%b %d')}) - @{msg['user']}:
+\"{msg['text'][:200]}...\"
+Permalink: {msg['permalink']}
+
+"""
+
+# 5. Include in AI review
+review_prompt = f"""
+Review this pull request:
+
+PR Title: {pr_data['title']}
+PR Description: {pr_data['body']}
+{slack_context}
+
+Diff:
+{pr_diff}
+
+If Slack context is present:
+1. Verify the PR implements what was discussed in Slack
+2. Check for gaps between Slack discussion and implementation
+3. Flag if the PR should address additional points raised by the team
+"""
+```
+
+## Example Review with Slack Context
+
+Here's how Slack context appears in an AI-generated review:
+
+```markdown
+# PR Review: Add rate limiting to auth endpoints
+
+## Team Discussion Context
+💬 **Slack conversation in #eng-infra (2 days ago)**:
+
+@alice: "We should add rate limiting to the auth endpoints. 100 req/min per IP."
+[View in Slack](https://workspace.slack.com/archives/C01234/p1710086400123456)
+
+@bob: "Agreed. Use Redis for tracking, it's already deployed. Check out the example in api-gateway."
+[View in Slack](https://workspace.slack.com/archives/C01234/p1710086500789012)
+
+## Implementation Analysis
+
+✅ **Matches team discussion**:
+- Rate limiting implemented: 100 requests/min per IP ✓
+- Using Redis for tracking ✓
+
+⚠️ **Potential gap**:
+- @bob mentioned "check out the example in api-gateway"
+- Current implementation uses a custom rate limiter
+- Consider: Is this consistent with the api-gateway pattern?
+
+## Suggestions
+
+1. **Verify consistency**: Review api-gateway rate limiter implementation
+   to ensure this follows the same pattern (easier to maintain)
+
+2. **Test with real traffic patterns**: 100 req/min might be too low
+   for authenticated users. Consider tiered limits:
+   - Anonymous: 100 req/min
+   - Authenticated: 1000 req/min
+
+3. **Document decision**: Add comment explaining why Redis was chosen
+   over alternative approaches
+
+## Verdict
+APPROVE_WITH_SUGGESTIONS - Implementation aligns with team discussion,
+but verify consistency with existing patterns.
+```
+
+## Channel Auto-Detection
+
+Automatically determine which channels to search based on PR metadata:
+
+```python
+def detect_relevant_channels(
+    pr_title: str,
+    pr_body: str,
+    changed_files: list[str],
+) -> list[str]:
+    """Detect which Slack channels are relevant for this PR.
+    
+    Returns:
+        List of channel names (without #)
+    """
+    channels = set()
+    
+    # 1. Explicit mentions in PR
+    text = f"{pr_title} {pr_body}"
+    explicit = re.findall(r"#([a-z0-9-]+)", text)
+    channels.update(explicit)
+    
+    # 2. Infer from changed files
+    if any(f.startswith("frontend/") for f in changed_files):
+        channels.add("eng-frontend")
+    if any(f.startswith("backend/") for f in changed_files):
+        channels.add("eng-backend")
+    if any(f.endswith(".sql") or "migrations/" in f for f in changed_files):
+        channels.add("eng-infra")
+    
+    # 3. Infer from PR labels/keywords
+    if "security" in text.lower():
+        channels.add("eng-security")
+    if "performance" in text.lower():
+        channels.add("eng-performance")
+    
+    return list(channels)[:3]  # Limit to 3 channels
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Limit search scope" icon="filter">
+    Only search 1-2 most relevant channels to avoid noise and rate limits
+  </Card>
+  
+  <Card title="Use focused queries" icon="magnifying-glass">
+    Extract specific keywords from PR title/body rather than searching entire PR text
+  </Card>
+  
+  <Card title="Cache results" icon="clock">
+    Cache Slack search results for 10-15 minutes to avoid duplicate queries
+  </Card>
+  
+  <Card title="Link to threads" icon="link">
+    Always include permalink so reviewers can read full thread context
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+### No Slack context appearing in reviews
+
+<Steps>
+  <Step title="Check environment variable">
+    ```bash
+    echo $SLACK_MCP_URL
+    ```
+    Must be set and non-empty.
+  </Step>
+  
+  <Step title="Test Slack MCP server directly">
+    ```bash
+    curl -X POST $SLACK_MCP_URL \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_messages",
+          "arguments": {"channel": "general", "query": "test", "days": 7}
+        }
+      }'
+    ```
+    Should return JSON with messages.
+  </Step>
+  
+  <Step title="Verify bot has channel access">
+    Slack bot must be invited to the channel:
+    ```
+    /invite @Nectr MCP
+    ```
+    Or make the bot token have workspace-level search permissions.
+  </Step>
+  
+  <Step title="Check channel name format">
+    Use channel name without `#`: `"eng-infra"` not `"#eng-infra"`
+  </Step>
+</Steps>
+
+### Bot permissions errors
+
+```
+Slack API error: missing_scope
+```
+
+Ensure your Slack app has these OAuth scopes:
+- `channels:history`
+- `channels:read`
+- `search:read`
+- `users:read`
+
+If you added scopes after installing, **reinstall the app**:
+1. Go to Slack API portal → Your App → **Install App**
+2. Click **Reinstall to Workspace**
+
+### Rate limiting
+
+```
+Slack API error: rate_limited
+```
+
+Slack has rate limits:
+- **Tier 2 methods** (conversations.history): 50 requests/min
+- **Tier 3 methods** (search.messages): 20 requests/min
+
+Implement caching and limit queries:
+```python
+import asyncio
+from functools import lru_cache
+
+@lru_cache(maxsize=100)
+async def cached_slack_search(channel: str, query: str, days: int):
+    """Cache Slack searches for 10 minutes."""
+    return await mcp_client.query_mcp_server(...)
+
+# Clear cache every 10 minutes
+asyncio.create_task(cache_clear_loop())
+```
+
+## Privacy Considerations
+
+<Warning>
+  Slack messages often contain private team discussions. Consider:
+  
+  1. **Only search public channels** - Never search DMs or private channels
+  2. **Limit retention** - Don't store Slack messages long-term
+  3. **Redact sensitive info** - Filter out tokens, passwords, emails
+  4. **Get team consent** - Inform team that Slack may be used for PR context
+</Warning>
+
+### Redacting Sensitive Information
+
+```python
+import re
+
+def redact_sensitive_info(text: str) -> str:
+    """Remove tokens, passwords, emails from Slack messages."""
+    # Redact tokens
+    text = re.sub(r"(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+", "<REDACTED_TOKEN>", text)
+    text = re.sub(r"[A-Za-z0-9+/]{40,}={0,2}", "<REDACTED_TOKEN>", text)
+    
+    # Redact emails
+    text = re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "<EMAIL>", text)
+    
+    # Redact passwords (common patterns)
+    text = re.sub(r"password[:\s]*[\S]+", "password: <REDACTED>", text, flags=re.IGNORECASE)
+    
+    return text
+
+# Apply to all Slack messages before including in review
+for msg in slack_messages:
+    msg["text"] = redact_sensitive_info(msg["text"])
+```
+
+## Related Integrations
+
+<CardGroup cols={2}>
+  <Card title="Linear Integration" icon="list-check" href="/integrations/linear">
+    Pull linked issues and task context
+  </Card>
+  <Card title="Sentry Integration" icon="bug" href="/integrations/sentry">
+    Surface production errors for changed files
+  </Card>
+</CardGroup>
+
+## Related Files
+
+- `app/mcp/client.py:118` - Generic `query_mcp_server()` method
+- `app/services/pr_review_service.py` - How external context is used in reviews
+- `app/core/config.py:70` - `SLACK_MCP_URL` setting

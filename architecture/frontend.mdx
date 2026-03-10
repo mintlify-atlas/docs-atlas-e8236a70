@@ -1,0 +1,469 @@
+---
+title: "Frontend Architecture"
+description: "Next.js 15 + React 19 application structure, routing, and component organization"
+---
+
+## Technology Stack
+
+The frontend is built with modern React and Next.js:
+
+- **Next.js 15** (App Router)
+- **React 19** (with React Server Components)
+- **TypeScript** (strict mode)
+- **TailwindCSS 4** (with custom design system)
+- **TanStack Query** (React Query v5) for data fetching
+- **Axios** for HTTP client
+- **React Hot Toast** for notifications
+
+## Project Structure
+
+```
+nectr-web/src/
+├── app/
+│   ├── page.tsx                  # Landing page (public)
+│   ├── layout.tsx                # Root layout (Providers, fonts)
+│   └── (dashboard)/
+│       ├── layout.tsx            # Dashboard layout (ProtectedRoute + AppLayout)
+│       ├── dashboard/page.tsx    # Main dashboard with top contributors
+│       ├── repos/page.tsx        # Connect repos (no GitHub redirect)
+│       ├── reviews/
+│       │   ├── page.tsx          # PR review history
+│       │   └── [id]/page.tsx     # Individual review detail
+│       ├── analytics/page.tsx    # Team analytics
+│       ├── team/page.tsx         # Team management
+│       ├── settings/page.tsx     # Account settings
+│       └── api-keys/page.tsx     # API key management
+├── components/
+│   ├── AppLayout.tsx         # Sidebar + Navbar + main content area
+│   ├── Sidebar.tsx           # Left navigation sidebar
+│   ├── Navbar.tsx            # Top navbar with mobile menu toggle
+│   ├── ProtectedRoute.tsx    # Auth guard (redirects to / if not logged in)
+│   ├── Providers.tsx         # QueryClientProvider + Toaster + AuthContext
+│   ├── dashboard/
+│   │   ├── StatsCard.tsx     # Metric card with icon, value, change
+│   │   └── StatusBadge.tsx   # Colored badge for review status
+│   └── ui/                   # shadcn/ui components (alert, button, card, etc.)
+├── contexts/
+│   └── AuthContext.tsx       # User state + loading state
+├── hooks/
+│   ├── useRepos.ts           # useRepos, useInstallRepo, useRescanRepo
+│   └── useAnalytics.ts       # useAnalyticsSummary, useTimeline, useInsights
+└── lib/
+    ├── api.ts                # Axios instance (base URL + withCredentials)
+    └── utils.ts              # cn() helper for Tailwind merging
+```
+
+## Routing (App Router)
+
+Next.js 15 uses the **App Router** with file-system based routing:
+
+<Accordion title="Public Routes">
+  - `/` - Landing page (marketing, login button)
+</Accordion>
+
+<Accordion title="Protected Routes (Dashboard Group)">
+  All routes under `app/(dashboard)/` require authentication:
+  
+  - `/dashboard` - Overview metrics + top contributors sparklines
+  - `/reviews` - PR review history table
+  - `/reviews/[id]` - Individual review detail
+  - `/analytics` - Team metrics, timeline, insights
+  - `/repos` - Connect/disconnect repositories
+  - `/team` - Team member management
+  - `/settings` - Account settings
+  - `/api-keys` - API key management
+</Accordion>
+
+## Authentication Flow
+
+### 1. GitHub OAuth (Server-Side)
+
+```tsx
+// Landing page: app/page.tsx
+const handleLogin = () => {
+  window.location.href = `${process.env.NEXT_PUBLIC_API_URL}/auth/github`;
+};
+```
+
+**Flow:**
+1. User clicks "Login with GitHub"
+2. Frontend redirects to `GET /auth/github` (backend)
+3. Backend redirects to `github.com/login/oauth/authorize`
+4. User authorizes app
+5. GitHub redirects to `GET /auth/github/callback` (backend)
+6. Backend exchanges code for token, creates user, sets JWT cookie
+7. Backend redirects to `${FRONTEND_URL}/dashboard`
+
+### 2. JWT Cookie Authentication
+
+```ts
+// lib/api.ts
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL,
+  withCredentials: true,  // Send JWT cookie with every request
+});
+
+export default api;
+```
+
+<Note>
+  **`withCredentials: true`** is critical. Without it, the browser won't send the `httpOnly` JWT cookie to the backend.
+</Note>
+
+### 3. Protected Route Guard
+
+```tsx
+// components/ProtectedRoute.tsx
+'use client';
+import { useAuthContext } from '@/contexts/AuthContext';
+import { useRouter } from 'next/navigation';
+import { useEffect } from 'react';
+
+export function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { user, loading } = useAuthContext();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!loading && !user) {
+      router.push('/');
+    }
+  }, [user, loading, router]);
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-screen">Loading...</div>;
+  }
+
+  if (!user) {
+    return null;
+  }
+
+  return <>{children}</>;
+}
+```
+
+<Note>
+  All dashboard routes use this guard via the `(dashboard)/layout.tsx` wrapper.
+</Note>
+
+## Data Fetching with TanStack Query
+
+All API calls use **React Query** for caching, background refetching, and optimistic updates.
+
+### Example: Fetch Repositories
+
+```ts
+// hooks/useRepos.ts
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import api from '@/lib/api';
+
+export function useRepos() {
+  return useQuery({
+    queryKey: ['repos'],
+    queryFn: async () => {
+      const res = await api.get('/api/v1/repos');
+      return res.data;
+    },
+  });
+}
+
+export function useInstallRepo() {
+  const qc = useQueryClient();
+  
+  return useMutation({
+    mutationFn: async ({ owner, repo }: { owner: string; repo: string }) => {
+      const res = await api.post(`/api/v1/repos/${owner}/${repo}/install`);
+      return res.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['repos'] });  // Refetch repo list
+    },
+  });
+}
+```
+
+### Example: Use in Component
+
+```tsx
+// app/(dashboard)/repos/page.tsx
+'use client';
+import { useRepos, useInstallRepo } from '@/hooks/useRepos';
+
+export default function ReposPage() {
+  const { data: repos, isLoading } = useRepos();
+  const installRepo = useInstallRepo();
+  
+  if (isLoading) return <div>Loading...</div>;
+  
+  return (
+    <div>
+      {repos?.map((repo: any) => (
+        <div key={repo.full_name}>
+          <h3>{repo.full_name}</h3>
+          {!repo.connected && (
+            <button onClick={() => installRepo.mutate({ 
+              owner: repo.owner, 
+              repo: repo.name 
+            })}>
+              Connect
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+<Accordion title="Query Caching Strategy">
+  - **Stale time**: 30 seconds (data is considered fresh)
+  - **Cache time**: 5 minutes (inactive queries remain in cache)
+  - **Refetch on window focus**: Enabled (keeps data fresh)
+  - **Retry**: 1 attempt on failure
+</Accordion>
+
+## Layout Components
+
+### AppLayout
+
+```tsx
+// components/AppLayout.tsx
+'use client';
+import { Sidebar } from './Sidebar';
+import { Navbar } from './Navbar';
+import { useState } from 'react';
+
+export function AppLayout({ children }: { children: React.ReactNode }) {
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  
+  return (
+    <div className="flex h-screen bg-surface-base">
+      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <Navbar onMenuClick={() => setSidebarOpen(true)} />
+        
+        <main className="flex-1 overflow-y-auto p-6">
+          {children}
+        </main>
+      </div>
+    </div>
+  );
+}
+```
+
+### Sidebar
+
+```tsx
+// components/Sidebar.tsx
+const NAV = [
+  { href: '/dashboard',   label: 'Dashboard',  icon: LayoutDashboard },
+  { href: '/reviews',     label: 'PR Reviews',  icon: GitPullRequest  },
+  { href: '/analytics',   label: 'Analytics',   icon: BarChart3       },
+  { href: '/repos',       label: 'Repos',       icon: GitBranch       },
+  { href: '/team',        label: 'Team',        icon: Users           },
+];
+
+export function Sidebar({ open, onClose }: SidebarProps) {
+  const pathname = usePathname();
+  const { user } = useAuthContext();
+  
+  return (
+    <aside className={cn(
+      'fixed lg:static inset-y-0 left-0 z-40 w-64 flex flex-col',
+      'bg-surface-elevated border-r border-surface-border',
+      open ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
+    )}>
+      {/* Logo */}
+      <div className="h-16 px-5 border-b">
+        <Link href="/dashboard">
+          <Image src="/assets/nectr-logo-dark.svg" alt="Nectr" width={88} height={28} />
+        </Link>
+      </div>
+      
+      {/* Nav items */}
+      <nav className="flex-1 px-3 py-4">
+        {NAV.map(({ href, label, icon: Icon }) => {
+          const active = pathname === href || pathname.startsWith(href + '/');
+          return (
+            <Link key={href} href={href} className={cn(
+              'flex items-center gap-3 px-3 py-2.5 rounded-lg',
+              active ? 'bg-amber/10 text-amber' : 'text-content-secondary',
+            )}>
+              <Icon size={16} />
+              {label}
+            </Link>
+          );
+        })}
+      </nav>
+      
+      {/* User footer */}
+      <div className="px-3 py-4 border-t">
+        {user && (
+          <div className="flex items-center gap-3">
+            <Image src={user.avatar_url} alt={user.github_username} width={32} height={32} className="rounded-full" />
+            <div>
+              <p className="text-sm font-medium">{user.name || user.github_username}</p>
+              <p className="text-xs text-content-secondary">@{user.github_username}</p>
+            </div>
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+```
+
+## Design System
+
+Nectr uses a custom design system built on **TailwindCSS 4**:
+
+<Accordion title="Color Palette">
+```css
+/* CSS variables in globals.css */
+:root {
+  --amber: #F59E0B;          /* Primary brand color */
+  --amber-hover: #D97706;    /* Darker shade */
+  
+  --surface-base: #0A0A0A;         /* Background */
+  --surface-elevated: #111111;     /* Cards, sidebar */
+  --surface-subtle: #1A1A1A;       /* Hover states */
+  --surface-border: #262626;       /* Dividers */
+  
+  --content-primary: #FFFFFF;      /* Headings */
+  --content-secondary: #A3A3A3;    /* Body text */
+  --content-muted: #737373;        /* Disabled */
+  
+  --danger: #EF4444;               /* Errors */
+  --success: #10B981;              /* Success */
+  --warning: #F59E0B;              /* Warnings */
+}
+```
+</Accordion>
+
+<Accordion title="Typography">
+- **Font**: Geist Sans (default), Geist Mono (code)
+- **Headings**: `font-bold`, `text-content-primary`
+- **Body**: `text-sm`, `text-content-secondary`
+- **Labels**: `text-xs`, `uppercase`, `tracking-wide`
+</Accordion>
+
+<Accordion title="Component Variants">
+All UI components follow shadcn/ui patterns:
+- **Button**: `default`, `secondary`, `outline`, `ghost`, `danger`
+- **Badge**: `default`, `success`, `warning`, `danger`
+- **Card**: Elevated background with border
+</Accordion>
+
+## State Management
+
+Nectr uses **React Context** for global state and **TanStack Query** for server state.
+
+### AuthContext
+
+```tsx
+// contexts/AuthContext.tsx
+import { createContext, useContext, useState, useEffect } from 'react';
+import api from '@/lib/api';
+
+const AuthContext = createContext<{
+  user: User | null;
+  loading: boolean;
+  refetch: () => Promise<void>;
+} | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  
+  const fetchUser = async () => {
+    try {
+      const res = await api.get('/auth/me');
+      setUser(res.data);
+    } catch {
+      setUser(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+  
+  useEffect(() => {
+    fetchUser();
+  }, []);
+  
+  return (
+    <AuthContext.Provider value={{ user, loading, refetch: fetchUser }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export const useAuthContext = () => {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error('useAuthContext must be used within AuthProvider');
+  return context;
+};
+```
+
+## Error Handling
+
+### API Error Interceptor
+
+```ts
+// lib/api.ts
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      window.location.href = '/';
+    }
+    return Promise.reject(error);
+  }
+);
+```
+
+### Toast Notifications
+
+```tsx
+import toast from 'react-hot-toast';
+
+try {
+  await installRepo.mutateAsync({ owner, repo });
+  toast.success('Repository connected!');
+} catch (error) {
+  toast.error('Failed to connect repository');
+}
+```
+
+## Performance Optimizations
+
+<Accordion title="Image Optimization">
+- All images use Next.js `<Image>` component
+- Automatic WebP conversion
+- Lazy loading with `loading="lazy"`
+- Priority loading for above-the-fold images
+</Accordion>
+
+<Accordion title="Code Splitting">
+- Dynamic imports for heavy components
+- Route-based code splitting (automatic)
+- `'use client'` only where necessary (most components are Server Components)
+</Accordion>
+
+<Accordion title="Query Optimizations">
+- Background refetching keeps data fresh
+- Prefetching on hover for navigation links
+- Optimistic updates for mutations
+</Accordion>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Data Flow" icon="workflow" href="/architecture/data-flow">
+    See how data flows from user action to UI update
+  </Card>
+  <Card title="Backend Architecture" icon="server" href="/architecture/backend">
+    Learn about the FastAPI backend
+  </Card>
+</CardGroup>

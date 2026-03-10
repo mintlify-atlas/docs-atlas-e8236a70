@@ -1,0 +1,837 @@
+---
+title: 'AI Agents'
+description: 'Claude-powered code review with agentic and parallel agent modes'
+icon: 'robot'
+---
+
+## Overview
+
+Nectr uses **Claude Sonnet 4.6** (from Anthropic) to analyze pull requests. The AI layer supports two review modes:
+
+1. **Standard Mode (Agentic)**: Single Claude instance with 8 MCP-style tools, fetches context on-demand
+2. **Parallel Mode**: Three specialized agents (security, performance, style) run concurrently, then a synthesis agent combines findings
+
+Both modes produce the same output format: a structured review with verdict, prose summary, inline suggestions, and semantic issue matches.
+
+<Info>
+Set `PARALLEL_REVIEW_AGENTS=true` to enable parallel mode. Standard mode is default.
+</Info>
+
+## Standard Mode (Agentic)
+
+### Architecture
+
+Claude receives **only the PR diff + file list**, then calls tools to fetch exactly the context it needs.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AGENTIC REVIEW LOOP                      │
+│                                                             │
+│  1. Claude receives: PR diff + file list                    │
+│  2. Claude calls tool (e.g., read_file, search_memory)      │
+│  3. Tool executor fetches data (GitHub, Neo4j, Mem0, MCP)   │
+│  4. Result returned to Claude                               │
+│  5. Claude calls another tool OR writes final review        │
+│  6. Loop continues (max 8 rounds)                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Available Tools
+
+<Accordion title="read_file">
+**Description**: Read the complete source code of a file at the PR's head commit
+
+**Use case**: When the diff alone doesn't show enough context (e.g., the full class a method belongs to, imports, or a callee)
+
+**Input**:
+```json
+{"path": "app/auth/login.py"}
+```
+
+**Output**:
+```markdown
+### app/auth/login.py
+```python
+from fastapi import APIRouter, Depends
+from app.core.database import get_db
+...
+```
+```
+
+**Implementation** (from `pr_review_service.py:291-300`):
+```python
+async def _read_file(self, path: str) -> str:
+    content = await github_client.get_file_content(
+        self.owner, self.repo, path, self.head_sha
+    )
+    if not content:
+        return f"File not found or empty: {path}"
+    if len(content) > 8000:
+        content = content[:8000] + "\n# ... (truncated at 8 000 chars)"
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return f"### {path}\n```{ext}\n{content}\n```"
+```
+</Accordion>
+
+<Accordion title="search_project_memory">
+**Description**: Search the project's accumulated knowledge for patterns, past decisions, and known risks
+
+**Use case**: When the diff touches an area you want to cross-check against historical context
+
+**Input**:
+```json
+{"query": "rate limiting strategy"}
+```
+
+**Output**:
+```
+- Uses Redis-backed rate limiter with sliding window (60 req/min per user)
+- Rate limit errors return 429 with Retry-After header
+```
+
+**Implementation** (from `pr_review_service.py:302-309`):
+```python
+async def _search_project_memory(self, query: str) -> str:
+    results = await memory_adapter.search_relevant(
+        repo=self.repo_full_name, query=query, developer=None, top_k=8
+    )
+    if not results:
+        return "No relevant project memories found."
+    lines = [f"- {m.get('memory', m.get('content', ''))}" for m in results]
+    return "\n".join(lines)
+```
+</Accordion>
+
+<Accordion title="search_developer_memory">
+**Description**: Search what Nectr has learned about a specific developer — their recurring patterns, known strengths, and past issues
+
+**Use case**: When the PR author is known and you want to tailor feedback
+
+**Input**:
+```json
+{"developer": "alice", "query": "error handling habits"}
+```
+
+**Output**:
+```
+@alice memory:
+- @alice occasionally forgets to handle token expiry in edge cases
+- @alice consistently writes comprehensive test coverage
+```
+
+**Implementation** (from `pr_review_service.py:311-318`):
+```python
+async def _search_developer_memory(self, developer: str, query: str) -> str:
+    results = await memory_adapter.search_relevant(
+        repo=self.repo_full_name, query=query, developer=developer, top_k=5
+    )
+    if not results:
+        return f"No memories found for @{developer}."
+    lines = [f"- {m.get('memory', m.get('content', ''))}" for m in results]
+    return f"@{developer} memory:\n" + "\n".join(lines)
+```
+</Accordion>
+
+<Accordion title="get_file_history">
+**Description**: Get (1) which developers have the most commits touching these files, and (2) past PRs that modified the same files
+
+**Use case**: To spot patterns like "this file keeps getting bug-fixed"
+
+**Input**:
+```json
+{"paths": ["app/auth/token_service.py", "app/auth/login.py"]}
+```
+
+**Output**:
+```
+File experts (most commits on these files):
+  @alice — 12 PRs
+  @bob — 7 PRs
+Related past PRs:
+  PR #42 [APPROVE] by @alice: Refactor auth service
+  PR #38 [REQUEST_CHANGES] by @bob: Fix login redirect
+```
+
+**Implementation** (from `pr_review_service.py:320-338`):
+```python
+async def _get_file_history(self, paths: list[str]) -> str:
+    experts, related = await asyncio.gather(
+        graph_builder.get_file_experts(self.repo_full_name, paths[:10], top_k=5),
+        graph_builder.get_related_prs(self.repo_full_name, paths[:10], top_k=5),
+        return_exceptions=True,
+    )
+    lines: list[str] = []
+    if isinstance(experts, list) and experts:
+        lines.append("File experts (most commits on these files):")
+        for e in experts:
+            lines.append(f"  @{e['login']} — {e['touch_count']} PRs")
+    if isinstance(related, list) and related:
+        lines.append("Related past PRs:")
+        for p in related:
+            lines.append(
+                f"  PR #{p['number']} [{p.get('verdict', '?')}] "
+                f"by @{p.get('author', '?')}: {p.get('title', '')}"
+            )
+    return "\n".join(lines) if lines else "No history found for these files."
+```
+</Accordion>
+
+<Accordion title="get_issue_details">
+**Description**: Fetch title, state, and description of specific GitHub issues (e.g., those mentioned in the PR body with 'Fixes #N')
+
+**Input**:
+```json
+{"numbers": [42, 38]}
+```
+
+**Output**:
+```
+Issue #42 [open]: Login redirect breaks on mobile
+  Users report that after login, mobile browsers redirect to...
+Issue #38 [closed]: Token expiry not handled
+  When JWT token expires, API returns 500 instead of 401
+```
+
+**Implementation** (from `pr_review_service.py:340-354`):
+```python
+async def _get_issue_details(self, numbers: list[int]) -> str:
+    results = await asyncio.gather(
+        *[github_client.get_issue(self.owner, self.repo, n) for n in numbers[:5]],
+        return_exceptions=True,
+    )
+    lines: list[str] = []
+    for n, r in zip(numbers, results):
+        if isinstance(r, Exception) or r is None:
+            lines.append(f"Issue #{n}: could not fetch")
+        else:
+            body_preview = (r.get("body") or "")[:200].replace("\n", " ")
+            lines.append(
+                f"Issue #{n} [{r.get('state', '?')}]: {r.get('title', '')}\n  {body_preview}"
+            )
+    return "\n".join(lines) if lines else "No issues found."
+```
+</Accordion>
+
+<Accordion title="search_open_issues">
+**Description**: Search open GitHub issues to find ones this PR might resolve even without an explicit 'Fixes #N' mention
+
+**Use case**: When you want to find semantic matches (issues resolved by behavior, not explicit reference)
+
+**Input**:
+```json
+{"keywords": "login redirect mobile"}
+```
+
+**Output**:
+```
+Issue #42: Login redirect breaks on mobile
+Issue #39: Mobile Safari login flow broken
+```
+
+**Implementation** (from `pr_review_service.py:356-365`):
+```python
+async def _search_open_issues(self, keywords: str) -> str:
+    kw_set = set(re.findall(r"\b\w{3,}\b", keywords.lower()))
+    matches: list[str] = []
+    for issue in self.candidate_issues:
+        text = f"{issue.get('title') or ''} {issue.get('body') or ''}".lower()
+        if len(kw_set & set(re.findall(r"\b\w{3,}\b", text))) >= 2:
+            matches.append(f"Issue #{issue['number']}: {issue.get('title', '')}")
+    if not matches:
+        return "No matching open issues found."
+    return "\n".join(matches[:8])
+```
+</Accordion>
+
+<Accordion title="get_linked_issues">
+**Description**: Fetch Linear or GitHub issues linked to this PR's feature area via MCP
+
+**Use case**: When you want to understand what user problem the PR is solving
+
+**Input**:
+```json
+{"query": "rate limiting", "source": "linear"}
+```
+
+**Output**:
+```
+Linked linear issues for 'rate limiting':
+  #ENG-42 [in progress]: Implement rate limiting for public API
+  #ENG-38 [done]: Add Redis cache for rate limit counters
+```
+
+**Implementation** (from `pr_review_service.py:368-406`):
+```python
+async def _get_linked_issues(self, query: str, source: str = "github") -> str:
+    from app.mcp.client import mcp_client
+    
+    try:
+        if source == "linear":
+            issues = await mcp_client.get_linear_issues(team_id="", query=query)
+        else:
+            issues = await mcp_client.get_github_issues(
+                repo=self.repo_full_name, query=query
+            )
+        
+        if not issues:
+            return f"No {source} issues found for query: {query!r}"
+        
+        lines = [f"Linked {source} issues for {query!r}:"]
+        for issue in issues[:10]:
+            number = issue.get("number") or issue.get("id", "?")
+            title = issue.get("title", "(no title)")
+            state = issue.get("state", "")
+            state_tag = f" [{state}]" if state else ""
+            body = (issue.get("description") or issue.get("body") or "")[:120].replace("\n", " ")
+            desc = f" — {body}" if body else ""
+            lines.append(f"  #{number}{state_tag}: {title}{desc}")
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.warning("_get_linked_issues failed: %s", exc)
+        return f"Could not fetch {source} issues: {exc}"
+```
+</Accordion>
+
+<Accordion title="get_related_errors">
+**Description**: Fetch recent Sentry production errors for files modified in this PR via MCP
+
+**Use case**: To check whether the PR might be fixing (or inadvertently introducing) a known error
+
+**Input**:
+```json
+{"files": ["app/auth/token_service.py"]}
+```
+
+**Output**:
+```
+Related Sentry errors for modified files:
+  [42x] JWTDecodeError: Invalid token signature — culprit: app.auth.token_service.decode_token (last seen: 2024-03-10)
+  [12x] KeyError: 'exp' in JWT payload — culprit: app.auth.token_service.validate_expiry (last seen: 2024-03-09)
+```
+
+**Implementation** (from `pr_review_service.py:408-461`):
+```python
+async def _get_related_errors(self, files: list[str]) -> str:
+    from app.mcp.client import mcp_client
+    from app.core.config import settings
+    
+    if not settings.SENTRY_MCP_URL:
+        return (
+            "Sentry integration not configured "
+            "(set SENTRY_MCP_URL + SENTRY_AUTH_TOKEN to enable)"
+        )
+    
+    all_errors: list[dict] = []
+    for path in files[:5]:
+        try:
+            errors = await mcp_client.get_sentry_errors(
+                project=self.repo,
+                filename=path,
+            )
+            all_errors.extend(errors)
+        except Exception as exc:
+            logger.warning("_get_related_errors failed for %s: %s", path, exc)
+    
+    if not all_errors:
+        return "No related Sentry errors found for the modified files."
+    
+    seen: set[str] = set()
+    lines = ["Related Sentry errors for modified files:"]
+    for err in all_errors[:10]:
+        key = str(err.get("id") or err.get("title", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        title = err.get("title", "(unknown error)")
+        culprit = err.get("culprit", "")
+        count = err.get("count", "?")
+        last_seen = err.get("last_seen", "")
+        lines.append(
+            f"  [{count}x] {title}"
+            + (f" — culprit: {culprit}" if culprit else "")
+            + (f" (last seen: {last_seen})" if last_seen else "")
+        )
+    return "\n".join(lines)
+```
+</Accordion>
+
+### Agentic Loop Implementation
+
+```python
+# app/services/ai_service.py:636-697
+for round_num in range(max_rounds):
+    response = await self.client.messages.create(
+        model=self.model,
+        max_tokens=4000,
+        tools=REVIEW_TOOLS,
+        messages=messages,
+    )
+    
+    logger.info(
+        f"Agentic review round {round_num + 1}: "
+        f"stop_reason={response.stop_reason}, "
+        f"tool_calls={sum(1 for b in response.content if b.type == 'tool_use')}"
+    )
+    
+    # ── Finished — extract prose ──────────────────────────────────
+    if response.stop_reason == "end_turn":
+        raw_text = "".join(
+            b.text for b in response.content if hasattr(b, "text")
+        )
+        break
+    
+    # ── Tool calls ────────────────────────────────────────────────
+    if response.stop_reason == "tool_use":
+        messages.append({"role": "assistant", "content": response.content})
+        
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            logger.info(f"Tool call: {block.name}({block.input})")
+            try:
+                result = await tool_executor.execute(block.name, block.input)
+            except Exception as exc:
+                result = f"Tool error: {exc}"
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            })
+        
+        messages.append({"role": "user", "content": tool_results})
+        continue
+    
+    # ── Unexpected stop reason ────────────────────────────────────
+    raw_text = "".join(b.text for b in response.content if hasattr(b, "text"))
+    break
+```
+
+**Safety cap**: 8 rounds maximum to prevent infinite tool-call loops.
+
+### Advantages
+
+<CardGroup cols={2}>
+
+<Card title="Efficient Context" icon="gauge-high">
+  Claude fetches only what it needs
+  
+  No wasted tokens on irrelevant context
+</Card>
+
+<Card title="Targeted Analysis" icon="crosshairs">
+  Each tool call is motivated by reasoning
+  
+  Sharper, less noisy reviews
+</Card>
+
+<Card title="Reasoning Thread" icon="timeline">
+  Claude follows its own logical flow
+  
+  read_file → check_history → search_memory
+</Card>
+
+<Card title="Graceful Degradation" icon="shield-check">
+  If a tool fails, Claude adapts
+  
+  Review completes with available data
+</Card>
+
+</CardGroup>
+
+## Parallel Mode
+
+### Architecture
+
+Three specialized agents run concurrently, then a synthesis agent combines their findings into one unified review.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   PARALLEL AGENT REVIEW                      │
+│                                                              │
+│  asyncio.gather():                                           │
+│    ├─ Security Agent    (tools: read_file, search_memory)   │
+│    ├─ Performance Agent (tools: read_file, get_history)      │
+│    └─ Style Agent       (tools: read_file, search_developer) │
+│                                                              │
+│  ▼                                                           │
+│  Synthesis Agent combines all findings:                      │
+│    - Deduplicate issues flagged by multiple agents           │
+│    - Assign final verdict (changes_requested / approved)     │
+│    - Merge inline_comments (max 8, most impactful)           │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Specialized Agents
+
+<Accordion title="Security Agent">
+**System Prompt** (from `ai_service.py:181-193`):
+```python
+SECURITY_AGENT_PROMPT = """You are a specialized security code reviewer. 
+Focus EXCLUSIVELY on security issues:
+- Injection vulnerabilities (SQL, command, path traversal, SSRF)
+- Authentication and authorization flaws
+- Secrets/credentials accidentally committed
+- Insecure dependencies or imports
+- Input validation gaps at trust boundaries
+- Cryptographic weaknesses
+- Sensitive data exposure (PII in logs, unencrypted storage)
+
+For each issue found: severity (CRITICAL/HIGH/MEDIUM/LOW), file:line, what the risk is, concrete fix.
+If no security issues: say "No security issues found" — do NOT invent issues.
+Be terse. Output JSON-serializable structured findings."""
+```
+
+**Tools**: `read_file`, `search_project_memory`, `get_issue_details`, `search_open_issues`
+
+**Example output**:
+```json
+[
+  {
+    "severity": "HIGH",
+    "file": "app/auth/token_service.py",
+    "line": 42,
+    "issue": "JWT tokens validated without signature verification — attacker can forge tokens",
+    "fix": "Use jwt.decode(..., verify_signature=True) and pass secret key"
+  }
+]
+```
+</Accordion>
+
+<Accordion title="Performance Agent">
+**System Prompt** (from `ai_service.py:195-207`):
+```python
+PERFORMANCE_AGENT_PROMPT = """You are a specialized performance code reviewer.
+Focus EXCLUSIVELY on performance issues:
+- N+1 database queries (loop + individual queries)
+- Missing indexes or inefficient query patterns
+- Unbounded loops or O(n²)+ algorithms where O(n log n) is feasible
+- Memory leaks (unclosed resources, unbounded caches, circular refs)
+- Blocking I/O in async contexts
+- Unnecessary serialization/deserialization in hot paths
+- Large payload transfers that could be paginated/streamed
+
+For each issue found: impact (HIGH/MEDIUM/LOW), file:line, what the bottleneck is, concrete fix.
+If no performance issues: say "No performance issues found" — do NOT invent issues.
+Be terse. Output JSON-serializable structured findings."""
+```
+
+**Tools**: `read_file`, `get_file_history`, `search_project_memory`
+
+**Example output**:
+```json
+[
+  {
+    "impact": "HIGH",
+    "file": "app/services/user_service.py",
+    "line": 78,
+    "issue": "N+1 query: loops over users and fetches posts individually — 100 users = 101 queries",
+    "fix": "Use selectinload(User.posts) in initial query to eager-load"
+  }
+]
+```
+</Accordion>
+
+<Accordion title="Style Agent">
+**System Prompt** (from `ai_service.py:209-221`):
+```python
+STYLE_AGENT_PROMPT = """You are a specialized code quality reviewer.
+Focus EXCLUSIVELY on code quality, tests, and maintainability:
+- Missing or inadequate test coverage for new logic
+- Functions/methods that are too complex (>20 lines, deep nesting)
+- Unclear variable/function naming that hinders readability
+- Missing error handling for operations that can fail
+- Dead code, unused imports, or leftover debug statements
+- API contract breakages (changed signatures, removed fields)
+- Missing or outdated docstrings on public interfaces
+
+For each issue: severity (HIGH/MEDIUM/LOW), file:line, what the issue is, concrete fix.
+If no style/quality issues: say "No style issues found" — do NOT invent issues.
+Be terse. Output JSON-serializable structured findings."""
+```
+
+**Tools**: `read_file`, `search_developer_memory`, `search_project_memory`, `search_open_issues`
+
+**Example output**:
+```json
+[
+  {
+    "severity": "MEDIUM",
+    "file": "app/services/payment_service.py",
+    "line": 123,
+    "issue": "No test coverage for stripe_webhook failure path",
+    "fix": "Add test case mocking Stripe API error to ensure graceful degradation"
+  }
+]
+```
+</Accordion>
+
+<Accordion title="Synthesis Agent">
+**System Prompt** (from `ai_service.py:867-898`):
+```python
+synthesis_prompt = f"""You are the final synthesizer for a parallel code review system.
+Three specialized agents have analyzed PR #{pr.get('number')} — "{pr_title}" by @{author}.
+
+SECURITY AGENT FINDINGS:
+{security_findings}
+
+PERFORMANCE AGENT FINDINGS:
+{performance_findings}
+
+STYLE/QUALITY AGENT FINDINGS:
+{style_findings}
+
+Based on ALL findings above, produce a final unified code review. Respond in this EXACT JSON format:
+{{
+  "verdict": "approved" | "changes_requested" | "comment",
+  "summary": "2-3 sentence overall assessment",
+  "security_issues": [],
+  "performance_issues": [],
+  "style_issues": [],
+  "inline_comments": [
+    {{"path": "file/path.py", "line": 42, "body": "specific comment"}}
+  ],
+  "memory_insights": "patterns worth remembering about this author/codebase"
+}}
+
+Rules:
+- verdict = "changes_requested" if ANY critical/high security or performance issue
+- verdict = "approved" if only low/medium style issues or no issues
+- verdict = "comment" if borderline (medium issues only)
+- Deduplicate if multiple agents flagged the same issue
+- inline_comments: max 8, most impactful only
+- Be constructive and specific"""
+```
+
+**Output**: Unified `PRReviewResult` matching standard mode's format
+</Accordion>
+
+### Parallel Execution
+
+```python
+# app/services/ai_service.py:770-795
+security_task = self._run_specialized_agent(
+    agent_name="security",
+    system_prompt=SECURITY_AGENT_PROMPT,
+    context=context_block,
+    tools=SECURITY_TOOLS,
+    tool_executor=tool_executor,
+)
+performance_task = self._run_specialized_agent(
+    agent_name="performance",
+    system_prompt=PERFORMANCE_AGENT_PROMPT,
+    context=context_block,
+    tools=PERFORMANCE_TOOLS,
+    tool_executor=tool_executor,
+)
+style_task = self._run_specialized_agent(
+    agent_name="style",
+    system_prompt=STYLE_AGENT_PROMPT,
+    context=context_block,
+    tools=STYLE_TOOLS,
+    tool_executor=tool_executor,
+)
+
+security_out, performance_out, style_out = await asyncio.gather(
+    security_task, performance_task, style_task,
+    return_exceptions=True
+)
+
+# Synthesis
+return await self._synthesize_review(
+    pr=pr, diff=diff, files=files,
+    security_findings=security_out,
+    performance_findings=performance_out,
+    style_findings=style_out,
+    issue_refs=issue_refs,
+)
+```
+
+**Error handling**: If any agent fails, synthesis continues with `"[agent_name] agent error: ..."`
+
+### Advantages
+
+<CardGroup cols={2}>
+
+<Card title="Faster Reviews" icon="bolt">
+  3 agents run in parallel
+  
+  10-20 seconds vs 15-30 seconds
+</Card>
+
+<Card title="Domain Expertise" icon="microscope">
+  Each agent focuses on its specialty
+  
+  More thorough in each domain
+</Card>
+
+<Card title="Deduplication" icon="layer-group">
+  Synthesis agent merges findings
+  
+  No repeated issues from multiple agents
+</Card>
+
+<Card title="Graceful Degradation" icon="life-ring">
+  If one agent fails, others continue
+  
+  Partial review better than no review
+</Card>
+
+</CardGroup>
+
+## Output Format
+
+Both modes produce a `PRReviewResult` (from `ai_service.py:232-241`):
+
+```python
+@dataclass
+class PRReviewResult:
+    summary: str                                     # Full prose markdown review
+    verdict: str = "NEEDS_DISCUSSION"                # "APPROVE" | "REQUEST_CHANGES" | "NEEDS_DISCUSSION"
+    inline_comments: list[dict] = field(default_factory=list)
+    # Each inline_comment: {file, line_hint, comment, suggestion}
+    semantic_issue_matches: list[dict] = field(default_factory=list)
+    # Each match: {number, title, confidence, reason}
+```
+
+### Prose Summary
+
+Markdown-formatted review with sections:
+
+```markdown
+## Summary
+<2-3 sentences: what does this PR do and why?>
+
+## Key Changes
+<3-5 bullets: `filename` — one-line description>
+
+## Issues
+- 🔴 **Critical:** <will cause failure, data loss, or security vulnerability>
+- 🟡 **Moderate:** <will cause problems under specific, concrete conditions>
+- 🟢 **Minor:** <clearly actionable style or efficiency issue>
+
+If no real issues exist: No issues found ✅
+
+**Confidence: X/5** — how confident you are this PR is safe to merge
+
+## Important Files Changed
+| File | Change |
+|------|--------|
+<one row per file>
+
+## Review Verdict
+**APPROVE**, **REQUEST_CHANGES**, or **NEEDS_DISCUSSION** — one-line reason.
+```
+
+### Inline Suggestions
+
+GitHub suggested-change format. Extracted from `<suggestions>` JSON block in Claude's response.
+
+**Example** (from `ai_service.py:378-401`):
+```json
+[
+  {
+    "file": "app/auth/token_service.py",
+    "line_hint": "    token = jwt.decode(raw_token, verify_signature=False)",
+    "comment": "JWT tokens validated without signature verification — attacker can forge tokens",
+    "suggestion": "    token = jwt.decode(raw_token, settings.JWT_SECRET, algorithms=['HS256'])"
+  },
+  {
+    "file": "app/services/user_service.py",
+    "line_hint": "    for user in users:",
+    "end_line_hint": "        user.posts = await get_posts(user.id)",
+    "comment": "N+1 query: loops over users and fetches posts individually",
+    "suggestion": "    users = await session.execute(\n        select(User).options(selectinload(User.posts))\n    )"
+  }
+]
+```
+
+**Line hint resolution**: `line_hint` is matched against the diff's `+` lines (with whitespace normalization) to resolve the absolute line number.
+
+### Semantic Issue Matches
+
+Issues this PR resolves without explicit `Fixes #N` mention. Extracted from `<semantic_issues>` JSON block.
+
+**Example**:
+```json
+[
+  {
+    "number": 42,
+    "confidence": "high",
+    "reason": "PR adds token signature verification, directly fixing the vulnerability described in issue #42"
+  }
+]
+```
+
+**Confidence filter**: Only `"high"` and `"medium"` matches are included (low-confidence matches are dropped).
+
+## Configuration
+
+### Model Selection
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4.6-20250514
+```
+
+### Mode Toggle
+
+```bash
+# Standard mode (default)
+PARALLEL_REVIEW_AGENTS=false
+
+# Parallel mode
+PARALLEL_REVIEW_AGENTS=true
+```
+
+### Token Limits
+
+- **Standard mode**: 4000 max tokens per response
+- **Parallel mode agents**: 2048 max tokens per agent
+- **Synthesis agent**: 3000 max tokens
+
+## Performance Comparison
+
+<CardGroup cols={2}>
+
+<Card title="Standard Mode" icon="clock">
+  **Average**: 15-30 seconds
+  
+  **Tool calls**: 2-4 per review
+  
+  **Context size**: 8-12 kB (diff + tool results)
+</Card>
+
+<Card title="Parallel Mode" icon="bolt">
+  **Average**: 10-20 seconds
+  
+  **Total tokens**: ~60% more (3 agents + synthesis)
+  
+  **Context size**: 12 kB per agent (diff only)
+</Card>
+
+</CardGroup>
+
+## When to Use Each Mode
+
+### Use Standard Mode When:
+
+- **Small to medium PRs** (&lt;500 lines): Context depth matters more than speed
+- **Context-heavy reviews**: PR needs deep cross-referencing of past decisions
+- **Exploratory changes**: PR touches unfamiliar code that needs research
+- **Cost-sensitive**: Fewer tokens used per review
+
+### Use Parallel Mode When:
+
+- **Large PRs** (>500 lines): Parallel execution saves time
+- **Security-critical repos**: Want thorough security review every time
+- **High-traffic repos**: Speed matters (10-20s vs 15-30s)
+- **Clear domains**: PR has distinct security/performance/style concerns
+
+## Related Files
+
+- `app/services/ai_service.py` — Claude integration + agentic + parallel modes ([view source](app/services/ai_service.py))
+- `app/services/pr_review_service.py` — Tool executor implementation ([view source](app/services/pr_review_service.py))
+- `app/core/config.py` — Environment variable config ([view source](app/core/config.py))

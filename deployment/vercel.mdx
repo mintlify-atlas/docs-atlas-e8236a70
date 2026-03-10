@@ -1,0 +1,333 @@
+---
+title: 'Deploy to Vercel'
+description: 'Deploy the Nectr Next.js frontend to Vercel'
+icon: 'triangle'
+---
+
+## Overview
+
+Vercel is the recommended platform for hosting the Nectr Next.js 15 frontend. This guide covers deploying the React 19 dashboard with proper API connectivity and authentication.
+
+<Note>
+The frontend on Vercel communicates with the backend on Railway. Deploy the backend first before proceeding with this guide.
+</Note>
+
+## Prerequisites
+
+Before deploying to Vercel, ensure you have:
+
+- A [Vercel account](https://vercel.com)
+- Backend deployed to Railway (see [Railway Deployment](/deployment/railway))
+- Your Railway backend URL (e.g., `https://nectr-production.up.railway.app`)
+
+## Deployment Steps
+
+<Steps>
+  <Step title="Import Project">
+    1. Log in to [Vercel](https://vercel.com)
+    2. Click **Add New** → **Project**
+    3. Import your Nectr GitHub repository
+    4. Vercel will automatically detect Next.js
+  </Step>
+
+  <Step title="Configure Root Directory">
+    The Next.js app is in the `nectr-web/` subdirectory:
+    
+    1. In the project settings, set **Root Directory** to `nectr-web`
+    2. Vercel will detect `vercel.json` with this configuration:
+    
+    ```json vercel.json
+    {
+      "rootDirectory": "nectr-web",
+      "framework": "nextjs"
+    }
+    ```
+    
+    <Note>
+    If you already have `vercel.json` in your repo root, Vercel will automatically use these settings.
+    </Note>
+  </Step>
+
+  <Step title="Set Environment Variables">
+    Add the following environment variable in Vercel project settings:
+    
+    ```bash
+    NEXT_PUBLIC_API_URL=https://your-backend.up.railway.app
+    ```
+    
+    **Important:** Replace `your-backend.up.railway.app` with your actual Railway backend URL.
+    
+    <Warning>
+    Do NOT include a trailing slash in `NEXT_PUBLIC_API_URL`. The frontend appends paths like `/api/v1/repos`.
+    </Warning>
+  </Step>
+
+  <Step title="Deploy">
+    1. Click **Deploy**
+    2. Vercel will build and deploy automatically
+    3. Monitor the build logs for any errors
+    4. Once deployed, copy your Vercel URL (e.g., `https://nectr.vercel.app`)
+  </Step>
+
+  <Step title="Update Backend Environment">
+    Return to Railway and update the `FRONTEND_URL` environment variable:
+    
+    ```bash
+    FRONTEND_URL=https://nectr.vercel.app
+    ```
+    
+    This ensures CORS is configured correctly for authentication cookies.
+  </Step>
+
+  <Step title="Update GitHub OAuth App">
+    If you haven't already, update your GitHub OAuth App's **Homepage URL**:
+    
+    ```
+    https://nectr.vercel.app
+    ```
+    
+    The **Authorization callback URL** should remain pointing to Railway:
+    ```
+    https://your-backend.up.railway.app/auth/github/callback
+    ```
+  </Step>
+</Steps>
+
+## Verify Deployment
+
+<Steps>
+  <Step title="Test Landing Page">
+    Visit your Vercel URL and verify the landing page loads correctly.
+  </Step>
+
+  <Step title="Test Authentication">
+    1. Click **Sign in with GitHub**
+    2. Complete OAuth flow
+    3. Verify you're redirected to `/dashboard`
+    4. Check that the dashboard loads data from the backend
+  </Step>
+
+  <Step title="Check API Connectivity">
+    Open browser DevTools → Network tab and verify:
+    - API requests go to your Railway backend URL
+    - Requests include `credentials: 'include'` for cookies
+    - CORS headers are present in responses
+  </Step>
+</Steps>
+
+## Frontend Architecture
+
+The Next.js frontend uses:
+
+- **Next.js 15** with App Router
+- **React 19** with Server Components
+- **TailwindCSS 4** for styling
+- **Axios** for API requests with credentials
+
+### API Client Configuration
+
+The frontend's API client is configured in `nectr-web/src/lib/api.ts`:
+
+```typescript nectr-web/src/lib/api.ts
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL,
+  withCredentials: true,  // Send httpOnly cookies
+});
+
+export default api;
+```
+
+### Environment Variable Usage
+
+The `NEXT_PUBLIC_API_URL` variable is used throughout the app:
+
+```typescript Example: useRepos hook
+const { data } = await api.get('/api/v1/repos');
+// Resolves to: https://your-backend.up.railway.app/api/v1/repos
+```
+
+## Continuous Deployment
+
+Vercel automatically deploys on every push:
+
+1. Push changes to your `main` branch
+2. Vercel detects the commit
+3. Builds the Next.js app with `npm run build`
+4. Deploys with zero-downtime
+5. Previous deployment remains active until new one is ready
+
+### Preview Deployments
+
+Vercel creates preview deployments for every pull request:
+- Unique URL per PR
+- Isolated from production
+- Automatic cleanup when PR is closed
+
+<Note>
+Preview deployments use the same `NEXT_PUBLIC_API_URL` as production. Consider creating a staging backend for testing.
+</Note>
+
+## Custom Domain
+
+Add a custom domain to your Vercel project:
+
+<Steps>
+  <Step title="Add Domain">
+    1. Go to Vercel project **Settings** → **Domains**
+    2. Add your domain (e.g., `nectr.yourdomain.com`)
+  </Step>
+
+  <Step title="Configure DNS">
+    Add a CNAME record in your DNS provider:
+    
+    ```
+    Type:  CNAME
+    Name:  nectr
+    Value: cname.vercel-dns.com
+    ```
+  </Step>
+
+  <Step title="Wait for Verification">
+    Vercel will automatically verify and issue SSL certificates.
+  </Step>
+
+  <Step title="Update Environment Variables">
+    Update `FRONTEND_URL` in Railway to use your custom domain:
+    
+    ```bash
+    FRONTEND_URL=https://nectr.yourdomain.com
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="API requests failing with CORS errors">
+    **Symptom:** Console shows CORS policy errors
+    
+    **Solution:**
+    1. Verify `FRONTEND_URL` is set correctly in Railway
+    2. Check that `NEXT_PUBLIC_API_URL` points to Railway backend
+    3. Ensure Railway backend includes CORS middleware:
+    ```python
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.FRONTEND_URL],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="Authentication not persisting">
+    **Symptom:** User logged out on page refresh
+    
+    **Solution:**
+    1. Verify cookies are being set by checking DevTools → Application → Cookies
+    2. Ensure cookies have these attributes:
+       - `httpOnly: true`
+       - `secure: true` (requires HTTPS)
+       - `sameSite: "none"` (for cross-origin)
+    3. Verify `withCredentials: true` in axios config
+  </Accordion>
+
+  <Accordion title="Environment variable not updating">
+    **Symptom:** Changed `NEXT_PUBLIC_API_URL` but app still uses old value
+    
+    **Solution:**
+    1. Environment variables are baked into the build at build time
+    2. Trigger a new deployment in Vercel after changing variables
+    3. Hard refresh the browser (Cmd+Shift+R or Ctrl+Shift+R)
+  </Accordion>
+
+  <Accordion title="Build failing in Vercel">
+    **Symptom:** Vercel build logs show errors
+    
+    **Solution:**
+    1. Check that all dependencies are in `nectr-web/package.json`
+    2. Verify Node.js version compatibility
+    3. Test build locally:
+    ```bash
+    cd nectr-web
+    npm install
+    npm run build
+    ```
+    4. Check for TypeScript errors
+  </Accordion>
+</AccordionGroup>
+
+## Performance Optimization
+
+### Enable Edge Runtime
+
+For faster response times, consider enabling Edge Runtime for API routes:
+
+```typescript app/api/route.ts
+export const runtime = 'edge';
+```
+
+### Image Optimization
+
+Next.js automatically optimizes images. Use the `<Image>` component:
+
+```tsx
+import Image from 'next/image';
+
+<Image
+  src="/logo.png"
+  alt="Nectr Logo"
+  width={200}
+  height={50}
+  priority
+/>
+```
+
+### Analytics
+
+Vercel provides built-in analytics:
+1. Go to project **Analytics** tab
+2. View page load times, Core Web Vitals, and visitor metrics
+
+## Cost Considerations
+
+Vercel pricing tiers:
+- **Hobby:** Free for personal projects
+- **Pro:** $20/month per user (recommended for production)
+- **Enterprise:** Custom pricing
+
+<Note>
+The Hobby plan is sufficient for testing, but production apps should use Pro for better performance and support.
+</Note>
+
+## Monitoring & Logs
+
+### View Logs
+
+1. Go to Vercel project → **Deployments**
+2. Click on a deployment
+3. View **Build Logs** or **Function Logs**
+
+### Real-Time Logs
+
+Install Vercel CLI for real-time logs:
+
+```bash
+npm i -g vercel
+vercel login
+vercel logs https://nectr.vercel.app --follow
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Connect Repositories" icon="link" href="/api/repos/connect">
+    Connect your first GitHub repository
+  </Card>
+  <Card title="Configure Integrations" icon="plug" href="/integrations/mcp-overview">
+    Set up Linear, Sentry, or Slack integrations
+  </Card>
+</CardGroup>

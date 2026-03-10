@@ -1,0 +1,266 @@
+---
+title: 'MCP Server Overview'
+description: 'Expose Nectr data through the Model Context Protocol'
+---
+
+## What is MCP?
+
+The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) is an open standard for connecting AI applications to external data sources and tools. Nectr implements MCP in two directions:
+
+<CardGroup cols={2}>
+  <Card title="Nectr as MCP Server" icon="arrow-up-right-from-square">
+    External agents (Claude Desktop, Linear, Slack bots) can query Nectr's review data, verdicts, and metrics.
+  </Card>
+  
+  <Card title="Nectr as MCP Client" icon="arrow-down-to-bracket">
+    Nectr pulls live context from Linear (issues), Sentry (errors), and Slack (messages) during PR reviews.
+  </Card>
+</CardGroup>
+
+## Nectr as MCP Server (Outbound)
+
+Nectr exposes its internal review data as an MCP server so external agents can access:
+
+- Recent PR reviews with AI verdicts
+- Contributor statistics from the Neo4j knowledge graph
+- Per-PR verdict lookup
+- Repository health scores
+
+### Transport Protocol
+
+Nectr's MCP server uses **Server-Sent Events (SSE)** over HTTP:
+
+- **SSE Stream**: `GET /mcp/sse` — Server-to-client event stream
+- **JSON-RPC**: `POST /mcp/messages` — Client-to-server message ingestion
+
+<Note>
+The MCP server is mounted directly in `app/main.py` as an ASGI sub-application because FastAPI's `include_router()` cannot handle ASGI apps.
+</Note>
+
+### Capabilities
+
+The MCP server exposes:
+
+- **4 Tools** — Callable functions for querying Nectr data
+- **1 Resource** — Streaming reviews as serialized JSON
+
+### Server Name
+
+The MCP server identifies itself as `"Nectr"` during capability exchange.
+
+## Endpoints
+
+<ParamField path="GET /mcp/sse" type="endpoint">
+  SSE event stream for server-to-client events. Used by MCP clients to receive tool results and server notifications.
+</ParamField>
+
+<ParamField path="POST /mcp/messages" type="endpoint">
+  JSON-RPC 2.0 message endpoint for client-to-server tool invocations and queries.
+</ParamField>
+
+## Connecting External Clients
+
+### Claude Desktop
+
+Add Nectr to your Claude Desktop MCP configuration:
+
+<CodeGroup>
+```json macOS
+{
+  "mcpServers": {
+    "nectr": {
+      "url": "https://your-backend.up.railway.app/mcp/sse"
+    }
+  }
+}
+```
+
+```json Windows
+{
+  "mcpServers": {
+    "nectr": {
+      "url": "https://your-backend.up.railway.app/mcp/sse"
+    }
+  }
+}
+```
+</CodeGroup>
+
+Configuration file location:
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+### Custom MCP Clients
+
+Use any MCP-compatible client library to connect:
+
+<CodeGroup>
+```python Python
+import httpx
+import json
+
+async def call_nectr_tool(tool_name: str, args: dict):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": args
+        }
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://your-backend.up.railway.app/mcp/messages",
+            json=payload
+        )
+        return response.json()
+
+# Example: Get recent reviews
+result = await call_nectr_tool(
+    "get_recent_reviews",
+    {"repo": "acme/backend", "limit": 10}
+)
+```
+
+```typescript TypeScript
+import { MCPClient } from '@modelcontextprotocol/sdk';
+
+const client = new MCPClient({
+  url: 'https://your-backend.up.railway.app/mcp/sse'
+});
+
+await client.connect();
+
+const reviews = await client.callTool('get_recent_reviews', {
+  repo: 'acme/backend',
+  limit: 10
+});
+
+console.log(reviews);
+```
+</CodeGroup>
+
+## Implementation Details
+
+### FastMCP Framework
+
+Nectr uses the [FastMCP](https://github.com/jlowin/fastmcp) framework for building the MCP server:
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("Nectr")
+
+@mcp.tool()
+async def get_recent_reviews(repo: str, limit: int = 10) -> list[dict]:
+    """Get recent PR reviews for a repository."""
+    # Implementation
+    pass
+```
+
+### Database Access
+
+All MCP tools query Nectr's PostgreSQL database using async SQLAlchemy:
+
+- **WorkflowRun** table — Stores PR review results
+- **Neo4j graph** — Contributor statistics
+- Graceful degradation if database is unreachable
+
+### Error Handling
+
+All tools implement defensive error handling:
+
+1. Try to query the database/graph
+2. On exception, log a warning and return empty list/dict
+3. Never crash — external agents always get a valid response
+
+<Info>
+This design ensures that external MCP clients can always connect to Nectr, even if some internal services (Neo4j, Mem0) are temporarily unavailable.
+</Info>
+
+## Authentication
+
+<Warning>
+The current MCP server implementation does **not** require authentication. This is suitable for internal/trusted network deployments only.
+
+For production use with untrusted clients, add authentication middleware:
+- JWT bearer token validation
+- API key verification
+- IP allowlist
+</Warning>
+
+## Use Cases
+
+### Linear Integration
+
+Query recent PR reviews when a developer mentions a PR in a Linear issue:
+
+```
+User: "Check if PR #123 in acme/backend was approved"
+Linear Bot → Calls get_pr_verdict("acme/backend", 123) → Returns verdict
+```
+
+### Slack Bot
+
+Post daily repository health summaries to a Slack channel:
+
+```
+Slack Bot → Calls get_repo_health("acme/backend")
+           → Posts: "acme/backend health score: 85/100 📊"
+```
+
+### Claude Desktop
+
+Ask Claude about your team's recent code reviews:
+
+```
+You: "What were the main issues in our last 10 PRs?"
+Claude → Calls get_recent_reviews("acme/backend", 10)
+        → Analyzes verdicts and summaries
+        → Returns: "The main issues were: ..."
+```
+
+### Custom Dashboards
+
+Build a custom analytics dashboard that pulls live data from Nectr:
+
+```javascript
+// React component
+const { data } = useQuery('repo-health', () =>
+  callMCPTool('get_repo_health', { repo: 'acme/backend' })
+);
+
+return <HealthScoreCard score={data.health_score} />;
+```
+
+## Source Code
+
+The MCP server implementation is located at:
+
+```
+app/mcp/server.py
+app/mcp/router.py (reference only)
+```
+
+Mounting in FastAPI:
+
+```python
+# app/main.py
+from app.mcp.server import mcp
+
+app.mount("/mcp", mcp.sse_app())
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="MCP Tools" href="/api/mcp/tools" icon="wrench">
+    Explore the 4 callable tools exposed by Nectr's MCP server
+  </Card>
+  
+  <Card title="MCP Resources" href="/api/mcp/resources" icon="database">
+    Learn about streaming resources for bulk data access
+  </Card>
+</CardGroup>

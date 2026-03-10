@@ -1,0 +1,442 @@
+---
+title: "MCP Client Integration"
+description: "How Nectr pulls context from Linear, Sentry, and Slack via Model Context Protocol"
+---
+
+## Overview
+
+Nectr acts as an **MCP client** to pull live context from external tools during PR reviews. This enriches reviews with:
+
+- **Linear issues** - Task descriptions and requirements
+- **Sentry errors** - Production errors related to changed files
+- **Slack messages** - Team discussions (future)
+
+<Note>
+  **All MCP integrations are optional.** If not configured, Nectr gracefully skips that source and logs an info message. Reviews continue normally.
+</Note>
+
+## Architecture
+
+**File:** `app/mcp/client.py`
+
+```python
+class MCPClientManager:
+    """Manages connections to external MCP servers.
+    
+    All methods are async and return plain Python dicts/lists.
+    Failures degrade gracefully (return empty lists).
+    """
+    
+    async def get_linear_issues(self, team_id: str, query: str) -> list[dict]
+    async def get_sentry_errors(self, project: str, filename: str) -> list[dict]
+    async def get_github_issues(self, repo: str, query: str) -> list[dict]
+```
+
+### Generic MCP Query Method
+
+All integrations use the same underlying protocol:
+
+```python
+async def query_mcp_server(
+    self,
+    server_url: str,
+    tool_name: str,
+    args: dict,
+    auth_token: str | None = None,
+) -> list[dict] | dict:
+    """Generic JSON-RPC 2.0 MCP tool call over HTTP."""
+    
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": args},
+    }
+    
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(f"{server_url}/", json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    
+    # Unwrap MCP content array
+    result = data.get("result", data)
+    if isinstance(result, dict):
+        content = result.get("content", result)
+        if isinstance(content, list):
+            items = []
+            for item in content:
+                if item.get("type") == "text":
+                    parsed = json.loads(item["text"])
+                    if isinstance(parsed, list):
+                        items.extend(parsed)
+                    else:
+                        items.append(parsed)
+            return items
+    
+    return []
+```
+
+<Accordion title="Why 10-second timeout?">
+  MCP context is **best-effort**. A slow external server should not block the PR review from completing. If a call times out, Nectr logs a warning and continues without that context.
+</Accordion>
+
+## Linear Integration
+
+### Configuration
+
+```env
+LINEAR_MCP_URL=https://your-linear-mcp-server.com
+LINEAR_API_KEY=lin_api_...
+```
+
+### Tool: get_linear_issues
+
+**Called by:** ReviewToolExecutor (`get_linked_issues` tool)
+
+```python
+async def get_linear_issues(self, team_id: str, query: str) -> list[dict]:
+    """Pull issues / tasks from the Linear MCP server matching *query*.
+    
+    Args:
+        team_id: Linear team identifier (e.g., "ENG").
+        query:   Free-text search query (topic, feature area, keyword).
+    
+    Returns:
+        List of issue dicts: {id, title, state, url, description}.
+        Empty list if Linear MCP is not configured or the call fails.
+    """
+    if not settings.LINEAR_MCP_URL:
+        logger.info("LINEAR_MCP_URL not configured — skipping Linear issue fetch")
+        return []
+    
+    return await self.query_mcp_server(
+        server_url=settings.LINEAR_MCP_URL,
+        tool_name="search_issues",
+        args={"team_id": team_id, "query": query},
+        auth_token=settings.LINEAR_API_KEY,
+    )
+```
+
+<Accordion title="Example Response">
+```json
+[
+  {
+    "id": "ENG-123",
+    "title": "Add JWT token refresh endpoint",
+    "state": "In Progress",
+    "url": "https://linear.app/team/issue/ENG-123",
+    "description": "Users need to refresh their tokens without re-authenticating..."
+  }
+]
+```
+</Accordion>
+
+### Use Case
+
+When Claude calls `get_linked_issues(query="JWT token refresh", source="linear")`, Nectr:
+
+1. Calls Linear MCP server with `search_issues` tool
+2. Returns list of matching issues
+3. Claude includes issue context in review (e.g., "This PR addresses ENG-123")
+
+<Note>
+  **Why not use Linear API directly?**
+  
+  MCP provides a **standardized protocol** for tool calling. If Linear changes their API, only the MCP server needs updating — Nectr's code stays the same.
+</Note>
+
+---
+
+## Sentry Integration
+
+### Configuration
+
+```env
+SENTRY_MCP_URL=https://your-sentry-mcp-server.com
+SENTRY_AUTH_TOKEN=...
+```
+
+### Tool: get_sentry_errors
+
+**Called by:** ReviewToolExecutor (`get_related_errors` tool)
+
+```python
+async def get_sentry_errors(self, project: str, filename: str) -> list[dict]:
+    """Get recent Sentry errors related to a file being reviewed.
+    
+    Args:
+        project:  Sentry project slug (e.g., "backend").
+        filename: File path from the PR diff to filter errors by.
+    
+    Returns:
+        List of error dicts: {id, title, culprit, count, last_seen}.
+        Empty list if Sentry MCP is not configured or the call fails.
+    """
+    if not settings.SENTRY_MCP_URL:
+        logger.info("SENTRY_MCP_URL not configured — skipping Sentry error fetch")
+        return []
+    
+    return await self.query_mcp_server(
+        server_url=settings.SENTRY_MCP_URL,
+        tool_name="search_errors",
+        args={"project": project, "filename": filename},
+        auth_token=settings.SENTRY_AUTH_TOKEN,
+    )
+```
+
+<Accordion title="Example Response">
+```json
+[
+  {
+    "id": "sentry-error-123",
+    "title": "JWTDecodeError: Invalid token signature",
+    "culprit": "app/auth/jwt_utils.py in verify_token",
+    "count": 42,
+    "last_seen": "2026-03-10T14:32:00Z"
+  }
+]
+```
+</Accordion>
+
+### Use Case
+
+When a PR modifies `app/auth/jwt_utils.py`, Claude calls:
+
+```python
+get_related_errors(files=["app/auth/jwt_utils.py"])
+```
+
+Nectr:
+1. Calls Sentry MCP server with `search_errors` tool
+2. Returns recent errors for that file
+3. Claude includes error context in review (e.g., "This PR might fix the recurring JWTDecodeError")
+
+<Accordion title="Why filter by filename?">
+  Sentry error culprits include stack traces. The MCP server filters errors where the top frame matches the given filename. This surfaces **production errors directly related to the code being reviewed**.
+</Accordion>
+
+---
+
+## GitHub Integration (Placeholder)
+
+```python
+async def get_github_issues(
+    self,
+    repo: str,
+    labels: list[str] | None = None,
+    query: str = "",
+) -> list[dict]:
+    """Pull open GitHub issues that a PR might be addressing.
+    
+    Returns an empty list — the native GitHub REST client in
+    ReviewToolExecutor covers issue fetching directly.
+    """
+    return []
+```
+
+<Note>
+  GitHub issues are fetched directly via GitHub REST API (not MCP) because Nectr already has GitHub credentials. This method is a placeholder for future use.
+</Note>
+
+---
+
+## How Claude Uses MCP Context
+
+### Tool Call Flow
+
+1. **Claude analyzes PR diff**
+   - Sees changes to `app/auth/jwt_utils.py`
+   - Decides to check for related production errors
+
+2. **Claude calls tool:**
+   ```json
+   {
+     "type": "tool_use",
+     "name": "get_related_errors",
+     "input": {
+       "files": ["app/auth/jwt_utils.py"]
+     }
+   }
+   ```
+
+3. **ReviewToolExecutor executes:**
+   ```python
+   async def _get_related_errors(self, files: list[str]) -> str:
+       from app.mcp.client import mcp_client
+       
+       all_errors = []
+       for path in files[:5]:
+           errors = await mcp_client.get_sentry_errors(
+               project=self.repo,
+               filename=path,
+           )
+           all_errors.extend(errors)
+       
+       if not all_errors:
+           return "No related Sentry errors found."
+       
+       lines = ["Related Sentry errors for modified files:"]
+       for err in all_errors[:10]:
+           title = err.get("title", "(unknown error)")
+           count = err.get("count", "?")
+           lines.append(f"  [{count}x] {title}")
+       
+       return "\n".join(lines)
+   ```
+
+4. **Claude receives result:**
+   ```
+   Related Sentry errors for modified files:
+     [42x] JWTDecodeError: Invalid token signature
+     [18x] TokenExpiredError: Token has expired
+   ```
+
+5. **Claude includes in review:**
+   > ## Issues
+   > 
+   > - 🟡 **Moderate:** The `verify_token()` function has 42 production errors in the last 30 days (`JWTDecodeError: Invalid token signature`). This PR changes signature validation logic — ensure backward compatibility.
+
+---
+
+## Error Handling
+
+All MCP calls are wrapped in try-except blocks that degrade gracefully:
+
+<Accordion title="Timeout (10 seconds)">
+```python
+except httpx.TimeoutException:
+    logger.warning(
+        "MCP call timed out: %s tool=%s (timeout=%ss)",
+        server_url, tool_name, _MCP_TIMEOUT,
+    )
+    return []
+```
+
+**User impact:** Review continues without MCP context. Claude doesn't know about Linear issues or Sentry errors for this PR.
+</Accordion>
+
+<Accordion title="HTTP Error (4xx/5xx)">
+```python
+except httpx.HTTPStatusError as exc:
+    logger.warning(
+        "MCP server returned HTTP %s for tool=%s: %s",
+        exc.response.status_code, tool_name, exc,
+    )
+    return []
+```
+
+**User impact:** Same as timeout — graceful degradation.
+</Accordion>
+
+<Accordion title="JSON Parse Error">
+```python
+except (json.JSONDecodeError, KeyError):
+    items.append(item)  # Keep raw item if JSON parse fails
+```
+
+**User impact:** MCP result is included as-is (might be less useful, but doesn't break review).
+</Accordion>
+
+---
+
+## Performance Characteristics
+
+| Integration | Typical Latency | Notes |
+|-------------|-----------------|-------|
+| Linear issues | 200-500 ms | Depends on Linear API speed |
+| Sentry errors | 300-800 ms | Depends on Sentry query complexity |
+| GitHub issues | N/A | Uses native GitHub REST API (not MCP) |
+
+<Note>
+  MCP calls run **in parallel** with other context fetching (Mem0, Neo4j). Total latency is bound by the slowest call, not the sum.
+</Note>
+
+---
+
+## Configuration Best Practices
+
+### Environment Variables
+
+```env
+# Required (if using Linear)
+LINEAR_MCP_URL=https://your-linear-mcp-server.com
+LINEAR_API_KEY=lin_api_...
+
+# Required (if using Sentry)
+SENTRY_MCP_URL=https://your-sentry-mcp-server.com
+SENTRY_AUTH_TOKEN=...
+
+# Optional (Slack — future)
+SLACK_MCP_URL=https://your-slack-mcp-server.com
+```
+
+<Accordion title="How to deploy your own MCP servers">
+  **Option 1: Use Anthropic's MCP servers** (if available)
+  - Check [Model Context Protocol docs](https://modelcontextprotocol.io) for official servers
+  
+  **Option 2: Build custom MCP servers**
+  - Use FastMCP (Python) or MCP TypeScript SDK
+  - Example: [FastMCP documentation](https://github.com/jlowin/fastmcp)
+  
+  **Option 3: Skip MCP**
+  - Leave `LINEAR_MCP_URL` and `SENTRY_MCP_URL` unset
+  - Nectr reviews still work — just without external context
+</Accordion>
+
+### Monitoring
+
+Check backend logs for MCP failures:
+
+```bash
+# Railway logs
+railway logs
+
+# Look for:
+# - "MCP call timed out: ..."
+# - "MCP server returned HTTP 500 ..."
+# - "LINEAR_MCP_URL not configured — skipping ..."
+```
+
+---
+
+## Future Integrations
+
+<Card title="Slack" icon="slack">
+  **Planned:** Pull relevant channel messages during PR reviews.
+  
+  **Use case:** If a PR mentions "authentication refactor", search Slack for recent discussions about auth to provide context.
+  
+  **Config:**
+  ```env
+  SLACK_MCP_URL=https://your-slack-mcp-server.com
+  ```
+</Card>
+
+<Card title="Datadog" icon="chart-line">
+  **Planned:** Pull APM traces and metrics for files being modified.
+  
+  **Use case:** If a PR touches a high-latency endpoint, surface recent performance data.
+  
+  **Config:**
+  ```env
+  DATADOG_MCP_URL=https://your-datadog-mcp-server.com
+  DATADOG_API_KEY=...
+  ```
+</Card>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Service Layer" icon="cog" href="/architecture/services">
+    Learn how ReviewToolExecutor uses MCP client
+  </Card>
+  <Card title="Data Flow" icon="workflow" href="/architecture/data-flow">
+    See MCP context in the PR review flow
+  </Card>
+</CardGroup>

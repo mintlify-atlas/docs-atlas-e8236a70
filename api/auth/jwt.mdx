@@ -1,0 +1,212 @@
+---
+title: "JWT Management"
+description: "JSON Web Token creation, validation, and authentication"
+---
+
+## JWT Token Structure
+
+The application uses JSON Web Tokens (JWT) for session management. Tokens are stored in httpOnly cookies for security.
+
+### Token Payload
+
+<ParamField body="sub" type="string" required>
+  Subject - User ID as a string
+</ParamField>
+
+<ParamField body="exp" type="integer" required>
+  Expiration time - Unix timestamp when the token expires
+</ParamField>
+
+<ParamField body="iat" type="integer" required>
+  Issued at - Unix timestamp when the token was created
+</ParamField>
+
+### Token Generation
+
+Tokens are created using the `create_access_token` function in `app/auth/jwt_utils.py:6`.
+
+<CodeGroup>
+```python Implementation
+def create_access_token(user_id: int) -> str:
+    """Create a JWT token for the given user ID."""
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    payload = {
+        "sub": str(user_id),
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+```
+
+```python Usage
+from app.auth.jwt_utils import create_access_token
+
+jwt_token = create_access_token(user.id)
+```
+</CodeGroup>
+
+### Configuration
+
+<ParamField query="SECRET_KEY" type="string" required>
+  Secret key used for signing JWT tokens. Must be kept secure.
+</ParamField>
+
+<ParamField query="ALGORITHM" type="string" default="HS256">
+  Algorithm used for JWT encoding/decoding
+</ParamField>
+
+<ParamField query="ACCESS_TOKEN_EXPIRE_MINUTES" type="integer">
+  Token expiration time in minutes
+</ParamField>
+
+---
+
+## Token Validation
+
+Tokens are validated using the `decode_access_token` function in `app/auth/jwt_utils.py:17`.
+
+<CodeGroup>
+```python Implementation
+def decode_access_token(token: str) -> int | None:
+    """Decode JWT and return user_id, or None if invalid/expired."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+        return int(user_id)
+    except JWTError:
+        return None
+```
+
+```python Usage
+from app.auth.jwt_utils import decode_access_token
+
+user_id = decode_access_token(token)
+if user_id is None:
+    # Token is invalid or expired
+    raise HTTPException(status_code=401, detail="Invalid token")
+```
+</CodeGroup>
+
+### Validation Rules
+
+1. **Signature Verification** - Token must be signed with the correct SECRET_KEY
+2. **Expiration Check** - Token must not be expired
+3. **Subject Presence** - Token must contain a "sub" claim with the user ID
+4. **Algorithm Match** - Token must use the configured algorithm
+
+### Return Values
+
+<ResponseField name="user_id" type="integer">
+  The user ID extracted from the token
+</ResponseField>
+
+<ResponseField name="None" type="null">
+  Returned when:
+  - Token signature is invalid
+  - Token is expired
+  - Token is malformed
+  - "sub" claim is missing
+</ResponseField>
+
+---
+
+## Authentication Dependency
+
+The `get_current_user` dependency function validates the JWT cookie and retrieves the authenticated user from the database.
+
+### Implementation
+
+Defined in `app/auth/dependencies.py:9`:
+
+<CodeGroup>
+```python Function
+async def get_current_user(
+    access_token: str | None = Cookie(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """
+    Read the httpOnly JWT cookie, decode it, and return the User.
+    Raises 401 if missing, invalid, or expired.
+    """
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    user_id = decode_access_token(access_token)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+```
+
+```python Usage in Endpoints
+from app.auth.dependencies import get_current_user
+from app.models.user import User
+
+@router.get("/protected")
+async def protected_route(current_user: User = Depends(get_current_user)):
+    return {"message": f"Hello, {current_user.github_username}"}
+```
+</CodeGroup>
+
+### Behavior
+
+1. Extracts the `access_token` from the httpOnly cookie
+2. Decodes and validates the JWT token
+3. Queries the database for the user by ID
+4. Returns the User object if found
+5. Raises HTTPException 401 for any authentication failure
+
+### Error Responses
+
+<ResponseField name="401" type="error">
+  **Not authenticated** - Cookie is missing
+</ResponseField>
+
+<ResponseField name="401" type="error">
+  **Invalid or expired token** - JWT validation failed
+</ResponseField>
+
+<ResponseField name="401" type="error">
+  **User not found** - User ID from token doesn't exist in database
+</ResponseField>
+
+---
+
+## Logout
+
+<RequestExample>
+```bash Request
+POST /auth/logout
+```
+</RequestExample>
+
+Clears the authentication cookie, effectively logging out the user.
+
+### Response
+
+<ResponseField name="message" type="string">
+  Confirmation message: "Logged out"
+</ResponseField>
+
+### Behavior
+
+- Deletes the `access_token` httpOnly cookie
+- Cookie deletion respects the same security settings (secure, samesite) as when it was set
+- No authentication required (can be called even if not logged in)
+
+<CodeGroup>
+```json 200 Response
+{
+  "message": "Logged out"
+}
+```
+</CodeGroup>

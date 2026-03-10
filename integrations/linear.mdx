@@ -1,0 +1,543 @@
+---
+title: "Linear Integration"
+description: "Pull linked issues and task context from Linear during PR reviews via MCP"
+---
+
+## Overview
+
+The Linear integration allows Nectr to pull issue and task data from Linear during PR reviews. When a PR references a Linear issue (e.g., "Fixes ENG-123"), Nectr fetches the full issue context — title, description, status, assignee — and includes it in the AI review.
+
+<Note>
+  This is an **inbound MCP integration** — Nectr acts as an MCP client connecting to a Linear MCP server.
+</Note>
+
+## How It Works
+
+<Steps>
+  <Step title="PR references Linear issue">
+    Developer includes Linear issue ID in PR title or body:
+    ```
+    Fixes ENG-123: Add user authentication
+    ```
+  </Step>
+  
+  <Step title="Nectr extracts issue IDs">
+    During PR review, Nectr parses the PR metadata to identify Linear issue references
+  </Step>
+  
+  <Step title="MCP query to Linear">
+    Nectr calls Linear MCP server via `MCPClientManager.get_linear_issues()`:
+    ```python
+    linear_issues = await mcp_client.get_linear_issues(
+        team_id="ENG",
+        query="ENG-123",
+    )
+    ```
+  </Step>
+  
+  <Step title="Context included in review">
+    Linear issue data is injected into the AI review prompt:
+    ```
+    LINEAR CONTEXT:
+    - Issue ENG-123: "Add user authentication"
+      Status: In Progress
+      Description: Implement OAuth flow with GitHub...
+    ```
+  </Step>
+  
+  <Step title="AI review considers issue context">
+    Claude can now verify:
+    - Does the PR actually address the issue?
+    - Are there gaps between the issue requirements and implementation?
+    - Should the PR include additional work mentioned in the issue?
+  </Step>
+</Steps>
+
+## Setup
+
+### 1. Deploy Linear MCP Server
+
+You need a Linear MCP server running separately from Nectr. Options:
+
+**Option A: Use official Linear MCP server**
+```bash
+# Install Linear MCP server
+npm install -g @linear/mcp-server
+
+# Run as HTTP server (not stdio)
+LINEAR_API_KEY=lin_api_... linear-mcp-server --http --port 8001
+```
+
+**Option B: Build your own Linear MCP server**
+```python
+from fastapi import FastAPI
+from mcp.server.fastmcp import FastMCP
+import httpx
+import os
+
+mcp = FastMCP("Linear")
+
+@mcp.tool()
+async def search_issues(team_id: str, query: str) -> list[dict]:
+    """Search Linear issues for a team."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.linear.app/graphql",
+            headers={
+                "Authorization": f"Bearer {os.getenv('LINEAR_API_KEY')}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "query": """
+                query SearchIssues($teamId: String!, $query: String!) {
+                  issues(filter: {team: {key: {eq: $teamId}}, title: {contains: $query}}) {
+                    nodes {
+                      id
+                      identifier
+                      title
+                      description
+                      state { name }
+                      assignee { name }
+                      url
+                    }
+                  }
+                }
+                """,
+                "variables": {"teamId": team_id, "query": query},
+            },
+        )
+        data = resp.json()
+        return data.get("data", {}).get("issues", {}).get("nodes", [])
+
+app = FastAPI()
+app.mount("/mcp", mcp.sse_app())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+```
+
+### 2. Get Linear API Key
+
+<Steps>
+  <Step title="Go to Linear settings">
+    Navigate to [linear.app/settings/api](https://linear.app/settings/api)
+  </Step>
+  
+  <Step title="Create personal API key">
+    Click "Create new key" and give it a name like "Nectr MCP"
+  </Step>
+  
+  <Step title="Copy the key">
+    Format: `lin_api_...`
+  </Step>
+</Steps>
+
+### 3. Configure Nectr
+
+Set environment variables in your Nectr backend:
+
+```env
+# Linear MCP server base URL
+LINEAR_MCP_URL=https://your-linear-mcp-server.railway.app
+
+# Linear personal API key (passed to MCP server via Authorization header)
+LINEAR_API_KEY=lin_api_...
+```
+
+<Warning>
+  Both `LINEAR_MCP_URL` and `LINEAR_API_KEY` must be set for the integration to work. If either is missing, Linear context will be silently skipped.
+</Warning>
+
+## API Reference
+
+### `MCPClientManager.get_linear_issues()`
+
+Pull issues from Linear MCP server matching a query.
+
+**Source:** `app/mcp/client.py:47`
+
+**Signature:**
+```python
+async def get_linear_issues(
+    self,
+    team_id: str,
+    query: str,
+) -> list[dict]:
+```
+
+**Parameters:**
+- `team_id` (str): Linear team identifier (e.g., `"ENG"`, `"DESIGN"`, `"INFRA"`)
+- `query` (str): Free-text search query — typically issue IDs or keywords
+
+**Returns:**
+```python
+[
+    {
+        "id": "abc123",
+        "identifier": "ENG-123",
+        "title": "Add user authentication",
+        "state": "In Progress",
+        "url": "https://linear.app/team/issue/ENG-123",
+        "description": "Implement OAuth flow with GitHub...",
+        "assignee": "Alice",
+    }
+]
+```
+
+Returns empty list `[]` if:
+- `LINEAR_MCP_URL` is not configured
+- Linear MCP server is unreachable
+- MCP call times out (10-second timeout)
+- No issues match the query
+
+**Example Usage:**
+```python
+from app.mcp.client import mcp_client
+
+# During PR review
+linear_refs = ["ENG-123", "ENG-456"]  # Extracted from PR body
+
+issues = await mcp_client.get_linear_issues(
+    team_id="ENG",
+    query=" ".join(linear_refs),
+)
+
+for issue in issues:
+    print(f"{issue['identifier']}: {issue['title']}")
+    print(f"  Status: {issue['state']}")
+    print(f"  URL: {issue['url']}")
+```
+
+## MCP Protocol Details
+
+Nectr calls the Linear MCP server using JSON-RPC 2.0 over HTTP:
+
+### Request Format
+
+```json
+POST https://linear-mcp-server.example.com/
+Content-Type: application/json
+Authorization: Bearer lin_api_...
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search_issues",
+    "arguments": {
+      "team_id": "ENG",
+      "query": "ENG-123 authentication"
+    }
+  }
+}
+```
+
+### Response Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "[{\"id\": \"abc123\", \"identifier\": \"ENG-123\", \"title\": \"Add user authentication\", ...}]"
+      }
+    ]
+  }
+}
+```
+
+Nectr's `MCPClientManager` unwraps this format automatically:
+
+```python
+# JSON-RPC 2.0 result shape: {"result": {"content": [...]}}
+result = data.get("result", data)
+if isinstance(result, dict):
+    content = result.get("content", result)
+    if isinstance(content, list):
+        # Each content item may be {type: "text", text: "<json>"}
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parsed = json.loads(item["text"])
+                # parsed is now the list of issues
+```
+
+## Timeout and Error Handling
+
+The Linear MCP client has a **10-second timeout** to prevent slow external services from blocking PR reviews.
+
+```python
+_MCP_TIMEOUT = 10.0  # seconds
+
+try:
+    async with httpx.AsyncClient(timeout=_MCP_TIMEOUT) as client:
+        response = await client.post(...)
+        response.raise_for_status()
+except httpx.TimeoutException:
+    logger.warning(
+        f"MCP call timed out: {settings.LINEAR_MCP_URL} tool=search_issues"
+    )
+    return []  # Empty list - review continues without Linear context
+except httpx.HTTPStatusError as exc:
+    logger.warning(f"Linear MCP returned HTTP {exc.response.status_code}")
+    return []
+except Exception as exc:
+    logger.warning(f"Linear MCP query failed: {exc}")
+    return []
+```
+
+<Note>
+  Linear integration is **best-effort**. If the MCP server is down or slow, PR reviews continue without Linear context. This is by design — external context should enhance reviews, not block them.
+</Note>
+
+## Identifying Linear Issues in PRs
+
+Nectr uses several strategies to identify Linear issue references:
+
+### Pattern Matching
+
+```python
+# Common patterns:
+# - "Fixes ENG-123"
+# - "Closes INFRA-456"
+# - "Resolves ENG-123, ENG-124"
+
+import re
+
+LINEAR_ISSUE_PATTERN = re.compile(
+    r"\b([A-Z]{2,10}-\d+)\b",  # Team prefix (2-10 uppercase letters) + dash + number
+    re.IGNORECASE,
+)
+
+def extract_linear_issue_ids(pr_title: str, pr_body: str) -> list[str]:
+    text = f"{pr_title} {pr_body}"
+    matches = LINEAR_ISSUE_PATTERN.findall(text)
+    return list(dict.fromkeys(matches))  # Deduplicate while preserving order
+
+# Example:
+pr_title = "Fixes ENG-123: Add authentication"
+pr_body = "This PR implements ENG-123 and partially addresses ENG-124."
+issue_ids = extract_linear_issue_ids(pr_title, pr_body)
+# Returns: ["ENG-123", "ENG-124"]
+```
+
+### Branch Name Detection
+
+```python
+# Branch names like:
+# - eng-123-add-auth
+# - feature/ENG-456-fix-bug
+
+def extract_issue_from_branch(branch_name: str) -> str | None:
+    match = LINEAR_ISSUE_PATTERN.search(branch_name)
+    return match.group(1) if match else None
+```
+
+## Usage in PR Review Flow
+
+Here's how Linear context is pulled during a review:
+
+```python
+# 1. Extract Linear issue IDs from PR metadata
+issue_ids = extract_linear_issue_ids(pr_data["title"], pr_data["body"])
+if pr_data.get("head", {}).get("ref"):
+    branch_issue = extract_issue_from_branch(pr_data["head"]["ref"])
+    if branch_issue:
+        issue_ids.append(branch_issue)
+
+# 2. Pull issue details from Linear MCP server
+linear_issues = []
+if issue_ids:
+    linear_issues = await mcp_client.get_linear_issues(
+        team_id="ENG",  # TODO: Make this configurable per repo
+        query=" ".join(issue_ids),
+    )
+
+# 3. Format Linear context for AI review prompt
+linear_context = ""
+if linear_issues:
+    linear_context = "\n\nLINEAR CONTEXT:\n"
+    for issue in linear_issues:
+        linear_context += f"""- Issue {issue['identifier']}: "{issue['title']}"
+  Status: {issue['state']}
+  URL: {issue['url']}
+  Description: {issue.get('description', 'N/A')[:300]}
+"""
+
+# 4. Include in AI review
+review_prompt = f"""
+Review this pull request:
+
+PR Title: {pr_data['title']}
+PR Description: {pr_data['body']}
+
+Changed Files: {changed_files}
+{linear_context}
+
+Diff:
+{pr_diff}
+
+Provide a structured review covering:
+1. Does this PR fully address the linked Linear issues?
+2. Are there gaps between issue requirements and implementation?
+...
+"""
+```
+
+## Example Review with Linear Context
+
+Here's how Linear context appears in an AI-generated review:
+
+```markdown
+# PR Review: Add authentication flow (ENG-123)
+
+## Linked Issues
+✅ **ENG-123**: Add user authentication
+   - Status: In Progress
+   - Assignee: Alice
+   - [View in Linear](https://linear.app/team/issue/ENG-123)
+
+## Summary
+This PR implements the OAuth flow described in ENG-123. The implementation
+aligns well with the issue requirements:
+- ✅ GitHub OAuth integration
+- ✅ Token encryption at rest
+- ⚠️  Issue mentions rate limiting, but I don't see it implemented
+
+## Suggestions
+1. **Missing requirement**: ENG-123 specifies rate limiting for failed auth
+   attempts. Consider adding a simple in-memory rate limiter.
+   
+2. **Test coverage**: Issue states this is a critical security feature.
+   Add E2E tests for the OAuth callback flow.
+
+## Verdict
+APPROVE_WITH_SUGGESTIONS - Strong implementation, but address rate limiting
+before merging per issue requirements.
+```
+
+## Team ID Configuration
+
+Currently, the team ID is passed directly to `get_linear_issues()`. You can make this configurable:
+
+### Per-Repository Team Mapping
+
+```python
+# Add to Installation model
+class Installation(Base):
+    # ...
+    linear_team_id: str | None = None  # e.g., "ENG", "INFRA"
+
+# Or use a mapping file
+LINEAR_TEAM_MAP = {
+    "nectr-ai/nectr": "ENG",
+    "nectr-ai/docs": "DOCS",
+    "nectr-ai/infra": "INFRA",
+}
+
+def get_team_id(repo_full_name: str) -> str:
+    return LINEAR_TEAM_MAP.get(repo_full_name, "ENG")  # Default to ENG
+```
+
+### Auto-Detection from Issue IDs
+
+```python
+def extract_team_from_issue_ids(issue_ids: list[str]) -> str | None:
+    """Extract team ID from issue identifiers.
+    
+    Examples:
+        ["ENG-123"] -> "ENG"
+        ["INFRA-456"] -> "INFRA"
+    """
+    if not issue_ids:
+        return None
+    # All issue IDs should have same team prefix
+    team_id = issue_ids[0].split("-")[0]
+    return team_id
+```
+
+## Troubleshooting
+
+### No Linear context appearing in reviews
+
+<Steps>
+  <Step title="Check environment variables">
+    ```bash
+    echo $LINEAR_MCP_URL
+    echo $LINEAR_API_KEY
+    ```
+    Both must be set and non-empty.
+  </Step>
+  
+  <Step title="Test Linear MCP server directly">
+    ```bash
+    curl -X POST $LINEAR_MCP_URL \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $LINEAR_API_KEY" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_issues",
+          "arguments": {"team_id": "ENG", "query": "test"}
+        }
+      }'
+    ```
+    Should return JSON with issues.
+  </Step>
+  
+  <Step title="Check Nectr logs">
+    ```bash
+    # Look for Linear MCP warnings
+    grep -i "linear" /var/log/nectr/app.log
+    ```
+    If you see "LINEAR_MCP_URL not configured", env vars aren't loaded.
+  </Step>
+  
+  <Step title="Verify PR has Linear issue references">
+    PR title or body must contain issue IDs like "ENG-123".
+  </Step>
+</Steps>
+
+### Linear MCP server timing out
+
+<Warning>
+  If Linear API is slow, increase the MCP timeout (default 10s):
+  ```python
+  # In app/mcp/client.py
+  _MCP_TIMEOUT = 20.0  # Increase to 20 seconds
+  ```
+</Warning>
+
+### Authentication errors
+
+```
+HTTP 401 from Linear MCP server
+```
+
+- **Check API key format**: Should start with `lin_api_`
+- **Verify key permissions**: Must have read access to issues
+- **Check key expiration**: Linear API keys don't expire but can be revoked
+
+## Related Integrations
+
+<CardGroup cols={2}>
+  <Card title="Sentry Integration" icon="bug" href="/integrations/sentry">
+    Pull production errors for changed files
+  </Card>
+  <Card title="Slack Integration" icon="slack" href="/integrations/slack">
+    Include relevant team messages in review context
+  </Card>
+</CardGroup>
+
+## Related Files
+
+- `app/mcp/client.py:47` - `get_linear_issues()` implementation
+- `app/mcp/client.py:118` - Generic `query_mcp_server()` method
+- `app/services/pr_review_service.py` - How Linear context is used in reviews
+- `app/core/config.py:66` - `LINEAR_MCP_URL` and `LINEAR_API_KEY` settings

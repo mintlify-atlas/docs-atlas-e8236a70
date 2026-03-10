@@ -1,0 +1,223 @@
+---
+title: "User Management"
+description: "User profile and authentication status endpoints"
+---
+
+## Get Current User
+
+<RequestExample>
+```bash cURL
+curl -X GET https://api.nectr.ai/auth/me \
+  -H "Cookie: access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+```javascript JavaScript
+fetch('https://api.nectr.ai/auth/me', {
+  credentials: 'include' // Includes httpOnly cookies
+})
+  .then(response => response.json())
+  .then(data => console.log(data));
+```
+
+```python Python
+import requests
+
+response = requests.get(
+    'https://api.nectr.ai/auth/me',
+    cookies={'access_token': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'}
+)
+user = response.json()
+```
+</RequestExample>
+
+Returns the profile information for the currently authenticated user.
+
+### Authentication
+
+<ParamField header="Cookie" type="string" required>
+  `access_token` - JWT token in httpOnly cookie (automatically sent by browsers)
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="integer">
+  Internal user ID
+</ResponseField>
+
+<ResponseField name="github_id" type="integer">
+  GitHub user ID
+</ResponseField>
+
+<ResponseField name="github_username" type="string">
+  GitHub username (login)
+</ResponseField>
+
+<ResponseField name="name" type="string | null">
+  User's full name from GitHub profile
+</ResponseField>
+
+<ResponseField name="email" type="string | null">
+  User's email address from GitHub
+</ResponseField>
+
+<ResponseField name="avatar_url" type="string | null">
+  URL to the user's GitHub avatar image
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp of when the user was created in the system
+</ResponseField>
+
+<CodeGroup>
+```json 200 Response
+{
+  "id": 123,
+  "github_id": 98765432,
+  "github_username": "octocat",
+  "name": "The Octocat",
+  "email": "octocat@github.com",
+  "avatar_url": "https://avatars.githubusercontent.com/u/98765432",
+  "created_at": "2024-01-15T10:30:00.000Z"
+}
+```
+
+```json 401 Unauthorized
+{
+  "detail": "Not authenticated"
+}
+```
+
+```json 401 Invalid Token
+{
+  "detail": "Invalid or expired token"
+}
+```
+
+```json 401 User Not Found
+{
+  "detail": "User not found"
+}
+```
+</CodeGroup>
+
+### Error Responses
+
+<ResponseField name="401" type="error">
+  **Not authenticated** - The `access_token` cookie is missing
+</ResponseField>
+
+<ResponseField name="401" type="error">
+  **Invalid or expired token** - The JWT token is invalid, malformed, or expired
+</ResponseField>
+
+<ResponseField name="401" type="error">
+  **User not found** - The user ID from the token doesn't exist in the database
+</ResponseField>
+
+---
+
+## User Model
+
+The User model represents an authenticated user in the system.
+
+### Database Schema
+
+<ParamField body="id" type="integer" required>
+  Primary key, auto-incremented
+</ParamField>
+
+<ParamField body="github_id" type="integer" required>
+  Unique GitHub user ID, indexed for fast lookups
+</ParamField>
+
+<ParamField body="github_username" type="string" required>
+  GitHub username (login)
+</ParamField>
+
+<ParamField body="github_access_token" type="string" required>
+  Encrypted GitHub OAuth access token. Encrypted using Fernet (AES-128-CBC + HMAC-SHA256) derived from SECRET_KEY.
+</ParamField>
+
+<ParamField body="email" type="string | null">
+  User's email address from GitHub. May be null if email is private.
+</ParamField>
+
+<ParamField body="avatar_url" type="string | null">
+  URL to the user's GitHub avatar image
+</ParamField>
+
+<ParamField body="name" type="string | null">
+  User's full name from GitHub profile
+</ParamField>
+
+<ParamField body="created_at" type="datetime">
+  Timestamp when the user was created (UTC, with timezone)
+</ParamField>
+
+<ParamField body="updated_at" type="datetime">
+  Timestamp when the user was last updated (UTC, with timezone)
+</ParamField>
+
+---
+
+## Token Encryption
+
+GitHub access tokens are encrypted at rest using symmetric encryption for security.
+
+### Implementation
+
+Defined in `app/auth/token_encryption.py`:
+
+<CodeGroup>
+```python Encrypt
+def encrypt_token(plaintext: str) -> str:
+    """Encrypt a GitHub access token for storage."""
+    f = _get_fernet()
+    return f.encrypt(plaintext.encode()).decode()
+```
+
+```python Decrypt
+def decrypt_token(ciphertext: str) -> str:
+    """
+    Decrypt a stored GitHub access token.
+    Handles legacy plaintext tokens gracefully during migration.
+    """
+    # Fast path: if it's clearly a plaintext GitHub token, return it directly
+    if _is_plaintext_token(ciphertext):
+        logger.warning("Found plaintext GitHub token — will be encrypted on next login")
+        return ciphertext
+
+    try:
+        f = _get_fernet()
+        return f.decrypt(ciphertext.encode()).decode()
+    except InvalidToken:
+        raise ValueError(
+            "GitHub token decryption failed. Please log out and sign in again."
+        )
+```
+</CodeGroup>
+
+### Encryption Details
+
+- **Algorithm**: Fernet (AES-128-CBC + HMAC-SHA256)
+- **Key Derivation**: SHA-256 hash of SECRET_KEY, encoded as URL-safe base64
+- **Security**: Provides confidentiality and authenticity
+
+### Token Prefixes
+
+The system recognizes these GitHub token prefixes for plaintext detection:
+- `ghp_` - Personal access token
+- `gho_` - OAuth access token
+- `ghs_` - Server-to-server token
+- `ghu_` - User access token
+- `github_pat_` - Fine-grained personal access token
+
+### Migration Support
+
+<Note>
+  The decryption function gracefully handles legacy plaintext tokens. If a token cannot be decrypted but matches a GitHub token prefix, it's returned as-is and a warning is logged. The token will be encrypted on the user's next login.
+</Note>
+
+<Warning>
+  If SECRET_KEY changes, all encrypted tokens become unreadable. Users must log out and sign in again to re-encrypt their tokens with the new key.
+</Warning>

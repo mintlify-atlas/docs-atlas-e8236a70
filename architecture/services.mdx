@@ -1,0 +1,520 @@
+---
+title: "Service Layer"
+description: "Deep dive into PR review, AI, context, and graph services"
+---
+
+## Service Architecture
+
+Nectr's service layer follows a **domain-driven design** where each service has a single responsibility:
+
+```
+services/
+├── pr_review_service.py      # Orchestrates full PR review workflow
+├── ai_service.py             # Claude AI integration + tool execution
+├── context_service.py        # Builds review context (Mem0 + Neo4j)
+├── graph_builder.py          # Neo4j read/write operations
+├── memory_adapter.py         # Mem0 async wrapper
+├── memory_extractor.py       # Post-review memory extraction
+└── project_scanner.py        # Initial repo scan on connect
+```
+
+## PR Review Service
+
+**File:** `app/services/pr_review_service.py`
+
+Orchestrates the complete PR review workflow from webhook to GitHub comment.
+
+### Class: PRReviewService
+
+<Accordion title="process_pr_review()">
+  Main entry point for PR review processing.
+  
+  ```python
+  async def process_pr_review(
+      self, 
+      payload: dict,           # GitHub webhook payload
+      event: Event,            # Database event record
+      db: AsyncSession,        # Database session
+      github_token: str | None = None
+  ) -> dict:
+  ```
+  
+  **Flow:**
+  1. Extract PR metadata (number, title, author, files)
+  2. Fetch diff + files from GitHub
+  3. Parse issue references from PR body (`Fixes #123`)
+  4. Find candidate issues (semantic matching)
+  5. Check for open PR conflicts (same files)
+  6. Create tool executor for agentic loop
+  7. Run AI analysis (standard or parallel mode)
+  8. Build review comment with sections:
+     - Summary
+     - Resolved issues
+     - Semantic issue matches
+     - Open PR conflicts
+     - Similar past work
+  9. Post review to GitHub (with inline suggestions)
+  10. Index PR in Neo4j
+  11. Extract memories to Mem0
+  12. Update event status
+</Accordion>
+
+### Class: ReviewToolExecutor
+
+Implements the tool executor protocol for Claude's agentic loop.
+
+<Card title="execute()" icon="play">
+  Routes tool calls to their implementations:
+  
+  - `read_file` → Fetch full source code from GitHub
+  - `search_project_memory` → Query Mem0 for project patterns
+  - `search_developer_memory` → Query Mem0 for developer habits
+  - `get_file_history` → Neo4j file experts + related PRs
+  - `get_issue_details` → Fetch GitHub issue metadata
+  - `search_open_issues` → Keyword search in candidate issues
+  - `get_linked_issues` → MCP client for Linear/GitHub
+  - `get_related_errors` → MCP client for Sentry
+</Card>
+
+<Accordion title="Tool: read_file">
+  ```python
+  async def _read_file(self, path: str) -> str:
+      content = await github_client.get_file_content(
+          self.owner, self.repo, path, self.head_sha
+      )
+      if len(content) > 8000:
+          content = content[:8000] + "\n# ... (truncated at 8,000 chars)"
+      ext = path.rsplit(".", 1)[-1].lower()
+      return f"### {path}\n```{ext}\n{content}\n```"
+  ```
+  
+  **Why truncate?** Claude has a 200k token context window, but reading 10+ full files can exceed it. Truncation keeps reviews focused.
+</Accordion>
+
+<Accordion title="Tool: get_file_history">
+  ```python
+  async def _get_file_history(self, paths: list[str]) -> str:
+      experts, related = await asyncio.gather(
+          graph_builder.get_file_experts(self.repo_full_name, paths[:10], top_k=5),
+          graph_builder.get_related_prs(self.repo_full_name, paths[:10], top_k=5),
+      )
+      
+      lines = []
+      if experts:
+          lines.append("File experts (most commits on these files):")
+          for e in experts:
+              lines.append(f"  @{e['login']} — {e['touch_count']} PRs")
+      
+      if related:
+          lines.append("Related past PRs:")
+          for p in related:
+              lines.append(
+                  f"  PR #{p['number']} [{p['verdict']}] "
+                  f"by @{p['author']}: {p['title']}"
+              )
+      
+      return "\n".join(lines)
+  ```
+</Accordion>
+
+### Helper Functions
+
+<Accordion title="_parse_issue_refs()">
+  Parses `Fixes #123`, `Closes #456`, `Resolves #789` from PR body + title.
+  
+  ```python
+  _ISSUE_REF_PATTERN = re.compile(
+      r"(?:^|(?<=\s))(?:fixes|closes|resolves)\s+#(\d+)",
+      re.IGNORECASE | re.MULTILINE,
+  )
+  
+  def _parse_issue_refs(pr_body: str, pr_title: str) -> list[int]:
+      text = f"{pr_title or ''} {pr_body or ''}"
+      matches = _ISSUE_REF_PATTERN.findall(text)
+      return list(dict.fromkeys(int(m) for m in matches))
+  ```
+</Accordion>
+
+<Accordion title="_find_candidate_issues()">
+  Finds open GitHub issues that might be resolved by this PR (semantic matching).
+  
+  **Algorithm:**
+  1. Fetch up to 50 open issues from GitHub
+  2. Build keyword set from PR title + body + file paths
+  3. Score each issue by keyword overlap
+  4. Return top 8 candidates (overlap ≥ 2 words)
+</Accordion>
+
+<Accordion title="_build_line_map()">
+  Parses diff `patch` field to map line content to absolute line numbers.
+  
+  **Why?** Claude returns `line_hint` (exact line content) in suggestions. We need to resolve this to a line number for GitHub's review API.
+  
+  ```python
+  def _build_line_map(files: list[dict]) -> dict[str, dict[str, int]]:
+      line_map = {}
+      for f in files:
+          patch = f.get("patch", "")
+          filename = f.get("filename", "")
+          mapping = {}
+          
+          for patch_line in patch.splitlines():
+              if patch_line.startswith("@@"):
+                  # Parse hunk header: @@ -10,5 +12,7 @@
+                  m = re.search(r"\+(\d+)", patch_line)
+                  if m:
+                      current_right_line = int(m.group(1)) - 1
+              elif patch_line.startswith("+"):
+                  current_right_line += 1
+                  content = patch_line[1:]  # Strip leading '+'
+                  stripped = content.strip()
+                  if stripped:
+                      mapping[content] = current_right_line
+                      mapping[stripped] = current_right_line
+                      mapping[_normalize_ws(stripped)] = current_right_line
+          
+          line_map[filename] = mapping
+      return line_map
+  ```
+</Accordion>
+
+---
+
+## AI Service
+
+**File:** `app/services/ai_service.py`
+
+Manages Claude AI interactions with agentic tool execution.
+
+### Class: AIServices
+
+<Card title="analyze_pull_request_agentic()" icon="brain">
+  **Agentic review mode** (default).
+  
+  Claude receives:
+  - PR metadata (title, body, author)
+  - Diff (up to 15,000 chars)
+  - File list with additions/deletions
+  - 8 tools to fetch context on-demand
+  
+  **Agentic loop:**
+  1. Send initial prompt with diff
+  2. Claude analyzes + calls tools
+  3. Execute tools → return results
+  4. Claude continues analysis
+  5. Repeat until `stop_reason == "end_turn"`
+  6. Parse output for verdict + inline suggestions
+</Card>
+
+<Accordion title="Tool Execution Loop">
+  ```python
+  messages = [{"role": "user", "content": initial_prompt}]
+  
+  for round_num in range(max_rounds):  # Safety cap at 8 rounds
+      response = await self.client.messages.create(
+          model=self.model,
+          max_tokens=4000,
+          tools=REVIEW_TOOLS,
+          messages=messages,
+      )
+      
+      if response.stop_reason == "end_turn":
+          raw_text = "".join(b.text for b in response.content if hasattr(b, "text"))
+          break
+      
+      if response.stop_reason == "tool_use":
+          messages.append({"role": "assistant", "content": response.content})
+          
+          tool_results = []
+          for block in response.content:
+              if block.type != "tool_use":
+                  continue
+              result = await tool_executor.execute(block.name, block.input)
+              tool_results.append({
+                  "type": "tool_result",
+                  "tool_use_id": block.id,
+                  "content": result,
+              })
+          
+          messages.append({"role": "user", "content": tool_results})
+          continue
+  
+  return self._parse_output(raw_text)
+  ```
+</Accordion>
+
+<Card title="analyze_pull_request_parallel()" icon="zap">
+  **Parallel review mode** (opt-in via `PARALLEL_REVIEW_AGENTS=true`).
+  
+  Runs **3 specialized agents** concurrently:
+  1. **Security agent** - Injection, auth flaws, secrets
+  2. **Performance agent** - N+1 queries, memory leaks, O(n²)
+  3. **Style agent** - Missing tests, unclear names, dead code
+  
+  Then a **synthesis agent** combines all findings into one review.
+</Card>
+
+<Accordion title="Specialized Agent Prompts">
+  ```python
+  SECURITY_AGENT_PROMPT = """You are a specialized security code reviewer.
+  Focus EXCLUSIVELY on security issues:
+  - Injection vulnerabilities (SQL, command, path traversal, SSRF)
+  - Authentication and authorization flaws
+  - Secrets/credentials accidentally committed
+  - Input validation gaps at trust boundaries
+  - Cryptographic weaknesses
+  
+  For each issue: severity (CRITICAL/HIGH/MEDIUM/LOW), file:line, risk, fix.
+  If no security issues: say "No security issues found"
+  """
+  
+  PERFORMANCE_AGENT_PROMPT = """You are a specialized performance code reviewer.
+  Focus EXCLUSIVELY on performance issues:
+  - N+1 database queries (loop + individual queries)
+  - Missing indexes or inefficient query patterns
+  - Unbounded loops or O(n²)+ algorithms
+  - Memory leaks (unclosed resources, unbounded caches)
+  - Blocking I/O in async contexts
+  
+  For each issue: impact (HIGH/MEDIUM/LOW), file:line, bottleneck, fix.
+  If no performance issues: say "No performance issues found"
+  """
+  
+  STYLE_AGENT_PROMPT = """You are a specialized code quality reviewer.
+  Focus EXCLUSIVELY on code quality, tests, and maintainability:
+  - Missing or inadequate test coverage
+  - Functions/methods that are too complex (>20 lines, deep nesting)
+  - Unclear variable/function naming
+  - Missing error handling
+  - Dead code, unused imports
+  - API contract breakages
+  
+  For each issue: severity (HIGH/MEDIUM/LOW), file:line, issue, fix.
+  If no style issues: say "No style issues found"
+  """
+  ```
+</Accordion>
+
+<Accordion title="Synthesis Agent">
+  ```python
+  async def _synthesize_review(
+      self,
+      pr: dict,
+      diff: str,
+      files: list[dict],
+      security_findings: str,
+      performance_findings: str,
+      style_findings: str,
+      issue_refs: list[int] | None,
+  ) -> dict:
+      synthesis_prompt = f"""You are the final synthesizer.
+      Three specialized agents analyzed PR #{pr['number']}.
+      
+      SECURITY: {security_findings}
+      PERFORMANCE: {performance_findings}
+      STYLE: {style_findings}
+      
+      Produce a unified review with:
+      - verdict: "approved" | "changes_requested" | "comment"
+      - summary: 2-3 sentence overall assessment
+      - inline_comments: max 8, most impactful only
+      
+      Rules:
+      - verdict = "changes_requested" if ANY critical/high security or performance issue
+      - verdict = "approved" if only low/medium style issues
+      - Deduplicate if multiple agents flagged the same issue
+      """
+      
+      response = await self.client.messages.create(
+          model=self.model,
+          max_tokens=3000,
+          messages=[{"role": "user", "content": synthesis_prompt}],
+      )
+      
+      return json.loads(response.content[0].text)
+  ```
+</Accordion>
+
+### Output Parsing
+
+<Accordion title="_parse_output()">
+  Extracts structured data from Claude's markdown response:
+  
+  1. **Verdict** - Regex match for `**APPROVE**`, `**REQUEST_CHANGES**`, or `**NEEDS_DISCUSSION**`
+  2. **Inline suggestions** - JSON block in `<suggestions>...</suggestions>` tags
+  3. **Semantic issue matches** - JSON block in `<semantic_issues>...</semantic_issues>` tags
+  
+  ```python
+  def _parse_output(self, raw_text: str) -> PRReviewResult:
+      # Extract suggestions
+      suggestions_match = re.search(r"<suggestions>\s*(.*?)\s*</suggestions>", raw_text, re.DOTALL)
+      inline_comments = []
+      if suggestions_match:
+          parsed = json.loads(suggestions_match.group(1))
+          inline_comments = parsed[:6]  # Cap at 6
+      
+      # Extract semantic issues
+      semantic_match = re.search(r"<semantic_issues>\s*(.*?)\s*</semantic_issues>", raw_text, re.DOTALL)
+      semantic_issue_matches = []
+      if semantic_match:
+          parsed = json.loads(semantic_match.group(1))
+          semantic_issue_matches = [
+              m for m in parsed
+              if m.get("confidence") in ("high", "medium")
+          ][:5]
+      
+      # Strip tagged blocks from prose
+      prose = re.sub(r"<suggestions>.*?</suggestions>", "", raw_text, flags=re.DOTALL)
+      prose = re.sub(r"<semantic_issues>.*?</semantic_issues>", "", prose, flags=re.DOTALL).strip()
+      
+      # Extract verdict
+      verdict = "NEEDS_DISCUSSION"
+      if "**APPROVE**" in prose:
+          verdict = "APPROVE"
+      elif "**REQUEST_CHANGES**" in prose:
+          verdict = "REQUEST_CHANGES"
+      
+      return PRReviewResult(
+          summary=prose,
+          verdict=verdict,
+          inline_comments=inline_comments,
+          semantic_issue_matches=semantic_issue_matches,
+      )
+  ```
+</Accordion>
+
+---
+
+## Context Service
+
+**File:** `app/services/context_service.py`
+
+Builds `ReviewContext` by combining Mem0 semantic memories and Neo4j structural context.
+
+<Card title="build_review_context()" icon="database">
+  ```python
+  async def build_review_context(
+      repo_full_name: str,
+      pr_title: str,
+      pr_description: str,
+      file_paths: list[str],
+      author: str,
+      pr_number: int | None = None,
+      open_prs: list[dict] | None = None,
+  ) -> ReviewContext:
+  ```
+  
+  **Parallel queries:**
+  1. **Mem0**: Project patterns, decisions, rules
+  2. **Mem0**: Developer-specific patterns, strengths
+  3. **Neo4j**: File experts (developers who touched files most)
+  4. **Neo4j**: Related past PRs (same files)
+  
+  **Returns:**
+  ```python
+  @dataclass
+  class ReviewContext:
+      project_memories: list[dict]
+      developer_memories: list[dict]
+      file_experts: list[dict]
+      related_prs: list[dict]
+      open_prs: list[dict]
+      serialized: str  # Human-readable context for prompt injection
+  ```
+</Card>
+
+<Accordion title="Serialized Context Format">
+  ```
+  PROJECT INTELLIGENCE:
+  - All auth routes require JWT middleware
+  - Use Pydantic for config, not raw env vars
+  - API responses must follow {data, error} shape
+  
+  DEVELOPER CONTEXT (alice):
+  - Tends to forget error handling in edge cases
+  - Writes excellent docstrings
+  - Prefers functional patterns over OOP
+  
+  FILE EXPERTS (developers who frequently touch these files):
+  - bob (12 PRs)
+  - alice (8 PRs)
+  
+  RELATED PAST PRs (touched same files):
+  - PR #145 [APPROVE] by bob: Refactor JWT token validation
+  - PR #132 [REQUEST_CHANGES] by alice: Add token refresh endpoint
+  
+  ⚠️  OPEN PRs TOUCHING THE SAME FILES (potential conflicts):
+  - PR #167 by charlie: Update auth middleware — shared files: app/auth/jwt_utils.py
+  ```
+</Accordion>
+
+---
+
+## Graph Builder Service
+
+**File:** `app/services/graph_builder.py`
+
+Builds and queries the Neo4j knowledge graph.
+
+<Card title="build_repo_graph()" icon="folder">
+  Called when a repo is connected (or on rescan).
+  
+  1. Fetch full recursive file tree from GitHub
+  2. Create `:Repository` node
+  3. Batch-create `:File` nodes (chunks of 200)
+  4. Create `[:CONTAINS]` edges
+  5. Remove stale files (deleted since last scan)
+</Card>
+
+<Card title="index_pr()" icon="git-pull-request">
+  Called after a PR review is posted.
+  
+  1. Create `:PullRequest` node
+  2. Create `:Developer` node
+  3. Create `[:AUTHORED_BY]` edge
+  4. Create `[:TOUCHES]` edges for changed files
+  5. Create `[:CLOSES]` edges for linked issues
+</Card>
+
+<Card title="get_file_experts()" icon="users">
+  Returns developers who most frequently touched the given files.
+  
+  ```cypher
+  UNWIND $paths AS path
+  MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File {path: path})
+  MATCH (pr)-[:AUTHORED_BY]->(d:Developer)
+  RETURN d.login AS login, count(*) AS touch_count
+  ORDER BY touch_count DESC
+  LIMIT $top_k
+  ```
+</Card>
+
+<Card title="get_related_prs()" icon="git-branch">
+  Returns past PRs that touched the same files (structural similarity).
+  
+  ```cypher
+  UNWIND $paths AS path
+  MATCH (pr:PullRequest {repo: $repo})-[:TOUCHES]->(f:File {path: path})
+  WHERE pr.verdict IS NOT NULL
+  WITH pr, count(DISTINCT f) AS overlap
+  ORDER BY overlap DESC
+  LIMIT $top_k
+  RETURN pr.number, pr.title, pr.author, pr.verdict, overlap
+  ```
+</Card>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Neo4j Graph" icon="share-2" href="/architecture/neo4j-graph">
+    Deep dive into graph schema and queries
+  </Card>
+  <Card title="Database Schema" icon="database" href="/architecture/database-schema">
+    PostgreSQL tables and relationships
+  </Card>
+  <Card title="MCP Client" icon="plug" href="/architecture/mcp-client">
+    How Nectr pulls Linear, Sentry, Slack data
+  </Card>
+</CardGroup>

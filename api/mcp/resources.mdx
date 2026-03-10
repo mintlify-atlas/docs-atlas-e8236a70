@@ -1,0 +1,353 @@
+---
+title: 'MCP Resources'
+description: 'Streaming data resources exposed by Nectr MCP server'
+---
+
+## Overview
+
+In addition to callable tools, Nectr's MCP server exposes **resources** — streaming data endpoints that external agents can subscribe to for bulk data access.
+
+Resources use URI patterns and return serialized JSON strings, making them ideal for:
+
+- Bulk data export
+- Real-time monitoring dashboards
+- Data synchronization with external systems
+- AI context augmentation
+
+<Info>
+Resources are read-only. To modify Nectr data, use the REST API endpoints instead.
+</Info>
+
+## reviews_resource
+
+Stream recent reviews for a repository as serialized JSON.
+
+### URI Pattern
+
+```
+nectr://repos/{owner}/{repo}/reviews
+```
+
+<ParamField path="owner" type="string" required>
+  Repository owner (GitHub username or organization)
+</ParamField>
+
+<ParamField path="repo" type="string" required>
+  Repository name
+</ParamField>
+
+### Example URIs
+
+```
+nectr://repos/acme/backend/reviews
+nectr://repos/openai/gpt-4/reviews
+nectr://repos/anthropic/claude-mcp/reviews
+```
+
+### Returns
+
+A JSON string containing an array of review objects (same schema as `get_recent_reviews` tool).
+
+<ResponseField name="[].id" type="integer" required>
+  Workflow run ID from the database
+</ResponseField>
+
+<ResponseField name="[].repo" type="string" required>
+  Full repository name (reconstructed as `owner/repo`)
+</ResponseField>
+
+<ResponseField name="[].pr_number" type="integer">
+  GitHub pull request number
+</ResponseField>
+
+<ResponseField name="[].verdict" type="string" required>
+  AI verdict: `APPROVED`, `CHANGES_REQUESTED`, `COMMENT`, or `UNKNOWN`
+</ResponseField>
+
+<ResponseField name="[].summary" type="string" required>
+  Plain-English review summary
+</ResponseField>
+
+<ResponseField name="[].created_at" type="string">
+  ISO 8601 timestamp when the review was created
+</ResponseField>
+
+<ResponseField name="[].status" type="string" required>
+  Workflow status: `completed`, `failed`, `processing`, or `pending`
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "resources/read",
+  "params": {
+    "uri": "nectr://repos/acme/backend/reviews"
+  }
+}
+```
+
+```json Response
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "contents": [
+      {
+        "uri": "nectr://repos/acme/backend/reviews",
+        "mimeType": "application/json",
+        "text": "[\n  {\n    \"id\": 42,\n    \"repo\": \"acme/backend\",\n    \"pr_number\": 123,\n    \"verdict\": \"APPROVED\",\n    \"summary\": \"Clean authentication implementation with proper error handling and test coverage.\",\n    \"created_at\": \"2026-03-10T14:32:15.123456\",\n    \"status\": \"completed\"\n  },\n  {\n    \"id\": 41,\n    \"repo\": \"acme/backend\",\n    \"pr_number\": 122,\n    \"verdict\": \"CHANGES_REQUESTED\",\n    \"summary\": \"SQL injection vulnerability in query builder. Missing input validation in user controller.\",\n    \"created_at\": \"2026-03-09T11:20:03.789012\",\n    \"status\": \"completed\"\n  }\n]"
+      }
+    ]
+  }
+}
+```
+</CodeGroup>
+
+### Parsed Response (Pretty)
+
+When parsed from the `text` field:
+
+```json
+[
+  {
+    "id": 42,
+    "repo": "acme/backend",
+    "pr_number": 123,
+    "verdict": "APPROVED",
+    "summary": "Clean authentication implementation with proper error handling and test coverage.",
+    "created_at": "2026-03-10T14:32:15.123456",
+    "status": "completed"
+  },
+  {
+    "id": 41,
+    "repo": "acme/backend",
+    "pr_number": 122,
+    "verdict": "CHANGES_REQUESTED",
+    "summary": "SQL injection vulnerability in query builder. Missing input validation in user controller.",
+    "created_at": "2026-03-09T11:20:03.789012",
+    "status": "completed"
+  }
+]
+```
+
+## Implementation
+
+The resource is registered using FastMCP's `@mcp.resource()` decorator:
+
+```python
+@mcp.resource("nectr://repos/{repo}/reviews")
+async def reviews_resource(repo: str) -> str:
+    """Recent reviews for a repository serialised as a JSON string."""
+    reviews = await _query_db_reviews(repo, limit=20)
+    return json.dumps(reviews, indent=2, default=str)
+```
+
+Source code location:
+
+```
+app/mcp/server.py:245
+```
+
+<Note>
+The `{repo}` parameter in the URI pattern expects the full repository name in the format `owner/repo`. The FastMCP framework automatically extracts this from the URI path.
+</Note>
+
+## Data Limit
+
+The resource returns the **20 most recent reviews** for the repository, ordered by `created_at DESC`.
+
+To fetch more reviews, use the `get_recent_reviews` tool with a custom `limit` parameter (up to 50).
+
+## Error Handling
+
+If the database query fails:
+
+1. `_query_db_reviews()` logs a warning
+2. Returns an empty list `[]`
+3. Resource returns `"[]"` as the JSON string
+
+The MCP client receives a valid response with an empty array:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "contents": [
+      {
+        "uri": "nectr://repos/acme/backend/reviews",
+        "mimeType": "application/json",
+        "text": "[]"
+      }
+    ]
+  }
+}
+```
+
+## Use Cases
+
+### Real-Time Monitoring Dashboard
+
+Subscribe to the reviews resource and update a dashboard whenever new reviews are posted:
+
+```javascript
+const client = new MCPClient({ url: 'https://nectr.example.com/mcp/sse' });
+
+client.subscribeToResource('nectr://repos/acme/backend/reviews', (data) => {
+  const reviews = JSON.parse(data.text);
+  updateDashboard(reviews);
+});
+```
+
+### Data Export
+
+Export all reviews for a repository to a JSON file:
+
+```python
+import httpx
+import json
+
+async def export_reviews(repo: str):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {"uri": f"nectr://repos/{repo}/reviews"}
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://nectr.example.com/mcp/messages",
+            json=payload
+        )
+        result = response.json()["result"]["contents"][0]["text"]
+        reviews = json.loads(result)
+        
+        with open(f"{repo.replace('/', '_')}_reviews.json", "w") as f:
+            json.dump(reviews, f, indent=2)
+
+await export_reviews("acme/backend")
+```
+
+### AI Context Augmentation
+
+Provide recent reviews as context to an AI agent:
+
+```
+System: You are a code review assistant. Here are the last 20 reviews for this repository:
+
+<reviews>
+{resource:nectr://repos/acme/backend/reviews}
+</reviews>
+
+User: What are the most common issues in our codebase?
+```
+
+### Slack Bot
+
+Post a summary of recent reviews to Slack every morning:
+
+```python
+import slack_sdk
+
+async def post_daily_summary(channel: str):
+    reviews = await read_resource("nectr://repos/acme/backend/reviews")
+    summary = summarize_reviews(reviews)
+    
+    slack_client.chat_postMessage(
+        channel=channel,
+        text=f"Daily Review Summary:\n{summary}"
+    )
+```
+
+## Comparison: Resources vs Tools
+
+| Feature | Resources | Tools |
+|---------|-----------|-------|
+| **Purpose** | Bulk data streaming | Specific queries |
+| **URI** | Custom scheme (e.g., `nectr://`) | Tool name (e.g., `get_recent_reviews`) |
+| **Parameters** | Embedded in URI path | Passed as arguments |
+| **Return Type** | Serialized JSON string | Structured dict/list |
+| **Limit** | Fixed (20 reviews) | Configurable (up to 50) |
+| **Best For** | Monitoring, export, sync | Single queries, filtering |
+
+<Tip>
+Use **resources** when you need to fetch all recent data for a repository. Use **tools** when you need to query specific PRs or apply filters.
+</Tip>
+
+## Future Resources (Roadmap)
+
+Planned additional resources:
+
+- `nectr://repos/{owner}/{repo}/contributors` — Top contributors with stats
+- `nectr://repos/{owner}/{repo}/health` — Repository health metrics
+- `nectr://repos/{owner}/{repo}/prs/{pr_number}` — Single PR review details
+- `nectr://repos/{owner}/{repo}/memories` — Project patterns and memories
+
+<Info>
+Want to request a new resource? Open an issue on [GitHub](https://github.com/nectr/nectr).
+</Info>
+
+## MCP Resource Protocol
+
+Nectr follows the MCP resource protocol specification:
+
+1. **Registration** — Resources are registered with URI patterns during server initialization
+2. **Discovery** — Clients can list available resources via `resources/list`
+3. **Subscription** — Clients can subscribe to resources for real-time updates (SSE)
+4. **Reading** — Clients can read resource contents via `resources/read` (JSON-RPC)
+
+### List Available Resources
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "resources/list"
+}
+```
+
+```json Response
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resources": [
+      {
+        "uri": "nectr://repos/{repo}/reviews",
+        "name": "Recent reviews for a repository",
+        "description": "Recent reviews for a repository serialised as a JSON string.",
+        "mimeType": "application/json"
+      }
+    ]
+  }
+}
+```
+</CodeGroup>
+
+## Authentication
+
+<Warning>
+Resources do **not** require authentication in the current implementation. This is suitable for internal/trusted deployments only.
+
+For production use, add authentication middleware at the FastAPI level.
+</Warning>
+
+## Source Code
+
+The reviews resource is implemented at:
+
+```
+app/mcp/server.py:245-252
+```
+
+Helper function:
+
+```
+app/mcp/server.py:33-80 (_query_db_reviews)
+```

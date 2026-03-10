@@ -1,0 +1,364 @@
+---
+title: "Backend Architecture"
+description: "FastAPI application structure, API routes, middleware, and service orchestration"
+---
+
+## Application Structure
+
+The backend is a **FastAPI** application (`app/main.py`) with async/await throughout. All I/O operations (database, Neo4j, HTTP calls) are non-blocking.
+
+```python
+app/
+├── main.py                       # FastAPI app entry, lifespan, CORS, middleware
+├── core/
+│   ├── config.py                 # Pydantic settings (all env vars)
+│   ├── database.py               # Async SQLAlchemy engine + session
+│   ├── neo4j_client.py           # Neo4j async driver singleton
+│   └── neo4j_schema.py           # Constraints + indexes
+├── models/
+│   ├── user.py                   # GitHub users
+│   ├── installation.py           # Connected repos + webhook secrets
+│   ├── event.py                  # Incoming webhook events
+│   ├── workflow.py               # PR review workflow runs
+│   └── oauth_state.py            # CSRF state tokens
+├── api/v1/
+│   ├── webhooks.py               # GitHub webhook receiver
+│   ├── repos.py                  # Connect / disconnect / rescan
+│   ├── reviews.py                # PR review history
+│   ├── events.py                 # Event queries
+│   ├── analytics.py              # Team metrics
+│   └── memory.py                 # Mem0 CRUD + project map
+├── auth/
+│   ├── router.py                 # GitHub OAuth flow
+│   ├── dependencies.py           # get_current_user() dependency
+│   ├── jwt_utils.py              # JWT sign + verify
+│   └── token_encryption.py       # Fernet encrypt/decrypt GitHub tokens
+├── services/
+│   ├── pr_review_service.py      # PR review orchestrator
+│   ├── ai_service.py             # Claude integration + parallel agents
+│   ├── context_service.py        # Mem0 + Neo4j + MCP context builder
+│   ├── graph_builder.py          # Neo4j read + write operations
+│   ├── memory_adapter.py         # Mem0 async wrapper
+│   ├── memory_extractor.py       # Post-review memory extraction
+│   └── project_scanner.py        # Initial repo scan on connect
+├── integrations/github/
+│   ├── client.py                 # GitHub REST API (diff, files, post review)
+│   └── webhook_manager.py        # Install / remove webhooks
+└── mcp/
+    ├── server.py                 # FastMCP server (4 tools + 1 resource)
+    └── client.py                 # MCP client (Linear, Sentry, Slack)
+```
+
+## Application Lifecycle
+
+The `lifespan` context manager in `app/main.py` handles startup and shutdown:
+
+<Accordion title="Startup Sequence">
+  1. **Run Alembic migrations** - Apply any pending database schema changes
+  2. **Create PostgreSQL tables** - Ensure all SQLAlchemy models are present
+  3. **Initialize Neo4j driver** - Connect to knowledge graph
+  4. **Create Neo4j schema** - Set up constraints and indexes
+  5. **Backfill repos** - Scan connected repos not yet in Neo4j (background task)
+</Accordion>
+
+<Accordion title="Shutdown Sequence">
+  1. **Dispose PostgreSQL engine** - Close all database connections
+  2. **Close Neo4j driver** - Gracefully disconnect from graph
+</Accordion>
+
+```python
+# app/main.py:88
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await asyncio.to_thread(_run_migrations)  # Alembic
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await init_driver()  # Neo4j
+    await create_schema()  # Neo4j constraints
+    asyncio.create_task(_scan_unindexed_repos())  # Background backfill
+    
+    yield
+    
+    # Shutdown
+    await engine.dispose()
+    await close_driver()
+```
+
+## API Routes
+
+### Authentication Routes
+
+<Card title="GET /auth/github" icon="github">
+  Starts GitHub OAuth flow. Redirects to `github.com/login/oauth/authorize` with `client_id` and `scope=repo,read:org`.
+</Card>
+
+<Card title="GET /auth/github/callback" icon="github">
+  OAuth callback endpoint. Exchanges authorization code for access token, creates/updates user, sets JWT cookie, redirects to frontend.
+</Card>
+
+<Card title="GET /auth/me" icon="user">
+  Returns current user profile (requires JWT cookie).
+</Card>
+
+<Card title="POST /auth/logout" icon="log-out">
+  Clears auth cookie.
+</Card>
+
+### Webhook Routes
+
+<Card title="POST /api/v1/webhooks/github" icon="webhook">
+  **Per-repo webhook receiver**
+  
+  1. Verify HMAC-SHA256 signature against `webhook_secret`
+  2. Deduplicate (ignore duplicate events within 1 hour)
+  3. Create `Event` row with `status=pending`
+  4. Return `HTTP 200` immediately (< 1 second)
+  5. Process PR in background via `BackgroundTask`
+</Card>
+
+### Repository Routes
+
+<Card title="GET /api/v1/repos" icon="folder">
+  Lists all GitHub repos accessible to the user with connection status.
+</Card>
+
+<Card title="POST /api/v1/repos/{owner}/{repo}/install" icon="plus">
+  Connects a repository:
+  1. Create `Installation` record
+  2. Install webhook (per-repo secret)
+  3. Scan file tree → Neo4j graph (background task)
+</Card>
+
+<Card title="POST /api/v1/repos/{owner}/{repo}/rescan" icon="refresh-cw">
+  Re-scans repository file tree and rebuilds Neo4j graph. Useful after repo restructure.
+</Card>
+
+<Card title="DELETE /api/v1/repos/{owner}/{repo}/install" icon="trash">
+  Disconnects repository:
+  1. Remove GitHub webhook
+  2. Mark `Installation` as inactive
+  3. (Optional) Delete Neo4j nodes/edges
+</Card>
+
+### Review Routes
+
+<Card title="GET /api/v1/reviews" icon="message-square">
+  Returns PR review history with filters:
+  - `repo`: Filter by repository
+  - `status`: Filter by status (completed, failed, pending)
+  - `limit`: Max results (default 20)
+</Card>
+
+### Analytics Routes
+
+<Card title="GET /api/v1/analytics" icon="bar-chart">
+  Returns team metrics:
+  - Total PRs reviewed
+  - Verdict distribution (approve/request_changes/needs_discussion)
+  - Top contributors
+  - Recent review timeline
+</Card>
+
+### Memory Routes
+
+<Card title="GET /api/v1/memory" icon="brain">
+  Lists Mem0 memories for a repository.
+</Card>
+
+<Card title="POST /api/v1/memory" icon="plus">
+  Manually adds a project rule or developer pattern to Mem0.
+</Card>
+
+<Card title="DELETE /api/v1/memory/{id}" icon="trash">
+  Removes a memory from Mem0.
+</Card>
+
+<Card title="GET /api/v1/memory/project-map" icon="map">
+  Returns aggregated project context summary (all memories).
+</Card>
+
+## Middleware Stack
+
+### CORS Middleware
+
+```python
+# app/main.py:143
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    settings.FRONTEND_URL,
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,  # Required for JWT cookies
+    allow_methods=["GET", "POST", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+```
+
+<Note>
+  `allow_credentials=True` is required because the frontend sends JWT cookies with `withCredentials: true` in axios.
+</Note>
+
+### Request Logging Middleware
+
+```python
+# app/main.py:180
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = round((time.time() - start) * 1000, 2)
+    logger.info(f"{request.method} {request.url.path} → {response.status_code} ({duration}ms)")
+    return response
+```
+
+Logs every HTTP request with method, path, status code, and duration in milliseconds.
+
+## MCP Server Mount
+
+```python
+# app/main.py:164
+try:
+    from app.mcp.server import mcp as _mcp_server
+    app.mount("/mcp", _mcp_server.sse_app())
+    logger.info("Nectr MCP server mounted at /mcp")
+except Exception as _mcp_err:
+    logger.warning("MCP server not mounted: %s", _mcp_err)
+```
+
+<Note>
+  **Why `mount()` instead of `include_router()`?**
+  
+  FastMCP's `sse_app()` returns a **Starlette ASGI application**, not an APIRouter. Mounting allows the MCP server to handle its own routing for SSE (`GET /mcp/sse`) and JSON-RPC (`POST /mcp/messages`).
+</Note>
+
+## Health Check Endpoint
+
+```python
+# app/main.py:190
+@app.get("/health")
+async def health_check():
+    uptime_seconds = round(time.time() - startup_time, 1)
+    
+    # Check PostgreSQL
+    db_status = "healthy"
+    try:
+        async with async_session() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+    
+    # Check Neo4j
+    neo4j_status = "not configured"
+    if neo4j_available():
+        try:
+            async with get_session() as session:
+                await session.run("RETURN 1")
+            neo4j_status = "healthy"
+        except Exception as e:
+            neo4j_status = f"unhealthy: {str(e)}"
+    
+    return {
+        "status": "healthy",
+        "service": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "environment": settings.APP_ENV,
+        "uptime_seconds": uptime_seconds,
+        "database": db_status,
+        "neo4j": neo4j_status,
+    }
+```
+
+<Accordion title="Example Response">
+```json
+{
+  "status": "healthy",
+  "service": "Nectr",
+  "version": "1.0.0",
+  "environment": "production",
+  "uptime_seconds": 3642.8,
+  "database": "healthy",
+  "neo4j": "healthy"
+}
+```
+</Accordion>
+
+## Environment Configuration
+
+All settings are managed via **Pydantic** in `app/core/config.py`:
+
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    # App
+    APP_NAME: str = "Nectr"
+    APP_VERSION: str = "1.0.0"
+    APP_ENV: str = "development"
+    DEBUG: bool = False
+    LOG_LEVEL: str = "INFO"
+    
+    # URLs
+    BACKEND_URL: str
+    FRONTEND_URL: str
+    
+    # Database
+    DATABASE_URL: str
+    
+    # Neo4j
+    NEO4J_URI: str
+    NEO4J_USERNAME: str
+    NEO4J_PASSWORD: str
+    
+    # Auth
+    SECRET_KEY: str  # For JWT + Fernet
+    GITHUB_CLIENT_ID: str
+    GITHUB_CLIENT_SECRET: str
+    GITHUB_PAT: str  # Personal access token for posting reviews
+    
+    # AI
+    ANTHROPIC_API_KEY: str
+    ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
+    
+    # Mem0
+    MEM0_API_KEY: str
+    
+    # MCP (optional)
+    LINEAR_MCP_URL: str | None = None
+    LINEAR_API_KEY: str | None = None
+    SENTRY_MCP_URL: str | None = None
+    SENTRY_AUTH_TOKEN: str | None = None
+    SLACK_MCP_URL: str | None = None
+    
+    # Feature flags
+    PARALLEL_REVIEW_AGENTS: bool = False
+    
+    class Config:
+        env_file = ".env"
+```
+
+<Note>
+  All MCP integration URLs are **optional**. If not set, Nectr gracefully skips that integration and logs an info message.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Service Layer" icon="cog" href="/architecture/services">
+    Deep dive into PR review, AI, and context services
+  </Card>
+  <Card title="Data Flow" icon="workflow" href="/architecture/data-flow">
+    Follow a webhook event through the entire system
+  </Card>
+  <Card title="Database Schema" icon="database" href="/architecture/database-schema">
+    PostgreSQL tables and relationships
+  </Card>
+  <Card title="Neo4j Graph" icon="share-2" href="/architecture/neo4j-graph">
+    Knowledge graph schema and queries
+  </Card>
+</CardGroup>

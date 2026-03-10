@@ -1,0 +1,619 @@
+---
+title: "GitHub Integration"
+description: "Connect repositories, install webhooks, and post AI-powered PR reviews directly on GitHub"
+---
+
+## Overview
+
+Nectr integrates deeply with GitHub to provide automated PR reviews. The integration consists of three main components:
+
+1. **GitHub OAuth** - Secure authentication flow for user login
+2. **REST API Client** - Fetches PR diffs, files, and posts review comments
+3. **Webhook Manager** - Installs per-repo webhooks to receive PR events in real-time
+
+## Authentication
+
+### GitHub OAuth Flow
+
+Users authenticate via GitHub OAuth to grant Nectr access to their repositories.
+
+<Steps>
+  <Step title="User initiates login">
+    User clicks "Login with GitHub" on the frontend
+  </Step>
+  
+  <Step title="OAuth redirect">
+    User is redirected to GitHub authorization page with configured scopes
+  </Step>
+  
+  <Step title="Callback handling">
+    GitHub redirects back to `/auth/github/callback` with authorization code
+  </Step>
+  
+  <Step title="Token exchange">
+    Backend exchanges code for access token and stores it encrypted with Fernet (AES-128-CBC)
+  </Step>
+</Steps>
+
+### Token Management
+
+The GitHub client supports two authentication modes:
+
+**User OAuth Token** (Preferred)
+```python
+# Used during webhook processing - no separate PAT needed
+headers = {
+    "Authorization": f"Bearer {user_oauth_token}",
+    "Accept": "application/vnd.github.v3+json",
+}
+```
+
+**Personal Access Token** (Fallback)
+```python
+# Fallback when OAuth token unavailable
+token = get_github_token()  # Tries gh CLI, then GITHUB_PAT env var
+```
+
+## Required Environment Variables
+
+```env
+# GitHub OAuth credentials
+GITHUB_CLIENT_ID=Ov23li...
+GITHUB_CLIENT_SECRET=1a2b3c4d5e...
+
+# Personal Access Token (optional fallback)
+GITHUB_PAT=ghp_...
+
+# Global webhook secret (optional, per-repo secrets take precedence)
+GITHUB_WEBHOOK_SECRET=your-webhook-secret
+```
+
+<Note>
+  The `GITHUB_PAT` is optional in production when using OAuth tokens. It's primarily used as a fallback or for development with the `gh` CLI.
+</Note>
+
+## GitHub REST API Client
+
+The `GithubClient` class (`app/integrations/github/client.py:38`) provides async methods for all GitHub operations.
+
+### Fetching PR Data
+
+<CodeGroup>
+```python Pull Request Details
+async def get_pull_request(owner: str, repo: str, pr_number: int) -> dict:
+    """Fetch PR metadata including title, description, author, and merge status."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+```
+
+```python PR Diff
+async def get_pr_diff(owner: str, repo: str, pr_number: int, token: str | None = None) -> str:
+    """Fetch unified diff for the PR. Returns plain text diff format."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = {**self._get_headers(token), "Accept": "application/vnd.github.v3.diff"}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        return response.text
+```
+
+```python Changed Files
+async def get_pr_files(owner: str, repo: str, pr_number: int, token: str | None = None) -> list:
+    """List all files changed in the PR with additions, deletions, and patch info."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(url, headers=self._get_headers(token))
+        response.raise_for_status()
+        return response.json()
+```
+
+```python File Content
+async def get_file_content(
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str,
+    max_size: int = 100_000,
+) -> str | None:
+    """Fetch file content at specific commit. Returns None for large or binary files."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=self.headers, params={"ref": ref})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("type") != "file" or data.get("size", 0) > max_size:
+            return None
+        return base64.b64decode(data.get("content", "")).decode("utf-8")
+```
+</CodeGroup>
+
+### Posting Reviews
+
+<CodeGroup>
+```python PR Comment (Top-Level)
+async def post_pr_comment(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    comment: str,
+    token: str | None = None,
+) -> dict:
+    """Post a top-level comment on the PR (issue comment thread)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            url,
+            headers=self._get_headers(token),
+            json={"body": comment}
+        )
+        response.raise_for_status()
+        return response.json()
+```
+
+```python PR Review (Summary + Inline Comments)
+async def post_pr_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    commit_id: str,
+    body: str,
+    event: str = "COMMENT",
+    comments: list[dict] | None = None,
+    token: str | None = None,
+) -> dict:
+    """Submit a pull request review with summary and optional inline comments.
+    
+    Args:
+        event: "COMMENT", "APPROVE", or "REQUEST_CHANGES"
+        comments: List of {path, line, body, side="RIGHT"} dicts
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    payload = {
+        "commit_id": commit_id,
+        "body": body,
+        "event": event,
+        "comments": comments or [],
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=self._get_headers(token), json=payload)
+        response.raise_for_status()
+        return response.json()
+```
+
+```python Inline Review Comment
+async def post_review_comment(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    commit_id: str,
+    path: str,
+    line: int,
+    body: str,
+    side: str = "RIGHT",
+) -> dict:
+    """Post a single inline review comment on a specific diff line."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
+    payload = {
+        "body": body,
+        "commit_id": commit_id,
+        "path": path,
+        "line": line,
+        "side": side,  # "RIGHT" (new) or "LEFT" (old)
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=self.headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+```
+</CodeGroup>
+
+### Repository Queries
+
+<CodeGroup>
+```python Issues
+async def get_repo_issues(
+    owner: str,
+    repo: str,
+    state: str = "all",
+    per_page: int = 50,
+) -> list[dict]:
+    """Get repository issues (excludes PRs)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(
+            url,
+            headers=self.headers,
+            params={
+                "state": state,
+                "per_page": per_page,
+                "page": 1,
+                "sort": "updated",
+                "direction": "desc",
+            },
+        )
+        response.raise_for_status()
+        return [item for item in response.json() if "pull_request" not in item]
+```
+
+```python Pull Requests
+async def get_repo_pull_requests(
+    owner: str,
+    repo: str,
+    state: str = "closed",
+    per_page: int = 50,
+) -> list[dict]:
+    """Get repository pull requests."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(
+            url,
+            headers=self.headers,
+            params={
+                "state": state,
+                "per_page": per_page,
+                "page": 1,
+                "sort": "updated",
+                "direction": "desc",
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+```
+
+```python Languages
+async def get_repo_languages(owner: str, repo: str) -> dict[str, int]:
+    """Get language breakdown (bytes per language)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/languages"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=self.headers)
+        response.raise_for_status()
+        return response.json()
+```
+
+```python Contributors
+async def get_repo_contributors(
+    owner: str,
+    repo: str,
+    per_page: int = 50,
+) -> list[dict]:
+    """Get repository contributors with commit counts."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contributors"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(
+            url,
+            headers=self.headers,
+            params={"per_page": per_page, "anon": "false"},
+        )
+        if response.status_code == 204:
+            return []
+        response.raise_for_status()
+        return response.json()
+```
+</CodeGroup>
+
+### PR State Caching
+
+The client implements an LRU + TTL cache for PR state checks:
+
+```python
+# Cache configuration
+PR_STATUS_CACHE_TTL = 60  # seconds
+PR_STATUS_CACHE_MAX = 500  # max entries
+
+async def get_pr_state(owner: str, repo: str, pr_number: int) -> str:
+    """Fetch current PR state with bounded LRU + TTL cache.
+    
+    Returns: "open", "closed", or "merged"
+    TTL: 60s for open PRs, 300s for closed/merged
+    """
+    cache_key = f"{owner}/{repo}#{pr_number}"
+    cached = self._pr_status_cache.get(cache_key)
+    if cached and cached[1] > time.monotonic():
+        self._pr_status_cache.move_to_end(cache_key)
+        return cached[0]
+
+    pr = await self.get_pull_request(owner, repo, pr_number)
+    status = "merged" if pr.get("merged") else pr.get("state", "open")
+
+    ttl = PR_STATUS_CACHE_TTL
+    if status in ("merged", "closed"):
+        ttl = 300  # Longer cache for terminal states
+    self._pr_status_cache[cache_key] = (status, time.monotonic() + ttl)
+    # ... eviction logic ...
+```
+
+## Webhook Management
+
+The webhook manager (`app/integrations/github/webhook_manager.py:10`) handles per-repo webhook lifecycle.
+
+### Installing Webhooks
+
+```python
+async def install_webhook(
+    owner: str,
+    repo: str,
+    access_token: str,
+    backend_url: str = "http://localhost:8000",
+) -> tuple[int, str]:
+    """Install a GitHub webhook on the given repo.
+    
+    Returns:
+        (webhook_id, webhook_secret) - Store these in the Installation table
+    """
+    webhook_secret = secrets.token_hex(32)
+    payload_url = f"{backend_url.rstrip('/')}/api/v1/webhooks/github"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://api.github.com/repos/{owner}/{repo}/hooks",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+            json={
+                "name": "web",
+                "active": True,
+                "events": ["pull_request", "issues"],  # PR opened/updated, issues linked
+                "config": {
+                    "url": payload_url,
+                    "content_type": "json",
+                    "secret": webhook_secret,
+                    "insecure_ssl": "0",
+                },
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    webhook_id = data["id"]
+    logger.info(f"Installed webhook {webhook_id} on {owner}/{repo}")
+    return webhook_id, webhook_secret
+```
+
+### Uninstalling Webhooks
+
+```python
+async def uninstall_webhook(
+    owner: str,
+    repo: str,
+    webhook_id: int,
+    access_token: str,
+) -> None:
+    """Delete a GitHub webhook from the given repo."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"https://api.github.com/repos/{owner}/{repo}/hooks/{webhook_id}",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+        )
+        if resp.status_code == 404:
+            logger.warning(f"Webhook {webhook_id} not found on {owner}/{repo} — already deleted?")
+            return
+        resp.raise_for_status()
+    logger.info(f"Uninstalled webhook {webhook_id} from {owner}/{repo}")
+```
+
+## Webhook Receiver
+
+The webhook endpoint (`/api/v1/webhooks/github`) receives events from GitHub and triggers PR reviews.
+
+### Signature Verification
+
+```python
+def verify_github_signature(payload_body: bytes, signature: str, secret: str) -> bool:
+    """Verify webhook authenticity using HMAC-SHA256.
+    
+    GitHub signs every webhook with the per-repo secret.
+    Signature format: "sha256=<hex_digest>"
+    """
+    if not secret:
+        return True  # Skip verification if no secret configured
+
+    expected = "sha256=" + hmac.new(
+        secret.encode(),
+        payload_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+```
+
+### Event Processing Flow
+
+<Steps>
+  <Step title="Webhook received">
+    GitHub POSTs to `/api/v1/webhooks/github` with event payload
+  </Step>
+  
+  <Step title="Signature verification">
+    Verify `X-Hub-Signature-256` header using per-repo webhook secret
+  </Step>
+  
+  <Step title="Event deduplication">
+    Check if identical event was processed within last hour (prevents duplicate reviews)
+  </Step>
+  
+  <Step title="Event persisted">
+    Create `Event` row with status="pending"
+  </Step>
+  
+  <Step title="Return 200 immediately">
+    GitHub has 10-second timeout, AI review takes 30-60 seconds
+  </Step>
+  
+  <Step title="Background processing">
+    `process_pr_in_background()` runs asynchronously:
+    - Fetch PR data via GitHub API
+    - Pull MCP context (Linear issues, Sentry errors)
+    - Build Neo4j + Mem0 context
+    - Run AI review
+    - Post review comment back to GitHub
+    - Index PR in knowledge graph
+    - Extract and store memories
+  </Step>
+</Steps>
+
+### Handling User OAuth Tokens
+
+```python
+# Look up the user who connected this repo and use their OAuth token
+repo_full_name = payload.get("repository", {}).get("full_name", "")
+github_token: str | None = None
+if repo_full_name:
+    inst_result = await db.execute(
+        select(Installation, User)
+        .join(User, Installation.user_id == User.id)
+        .where(
+            Installation.repo_full_name == repo_full_name,
+            Installation.is_active == True,
+        )
+    )
+    row = inst_result.first()
+    if row:
+        _, user = row
+        github_token = decrypt_token(user.github_access_token)
+        logger.info(f"Using OAuth token for user @{user.github_username}")
+
+# Pass token to review service - no separate PAT needed
+review_result = await pr_review_service.process_pr_review(
+    payload, event, db, github_token=github_token
+)
+```
+
+<Note>
+  This approach means Nectr posts reviews as the user who connected the repo, not as a bot account. The review appears to come from your GitHub account.
+</Note>
+
+## Usage Example
+
+Here's how the GitHub integration is used in the PR review flow:
+
+```python
+from app.integrations.github.client import github_client
+
+# 1. Fetch PR data when webhook arrives
+owner, repo = "nectr-ai", "nectr"
+pr_number = 42
+
+pr_data = await github_client.get_pull_request(owner, repo, pr_number)
+diff = await github_client.get_pr_diff(owner, repo, pr_number, token=user_oauth_token)
+files = await github_client.get_pr_files(owner, repo, pr_number, token=user_oauth_token)
+
+# 2. Get full content for critical files (not just diff)
+for file in files[:10]:  # Limit to 10 files to avoid API rate limits
+    if file["filename"].endswith((".py", ".ts", ".tsx")):
+        content = await github_client.get_file_content(
+            owner, repo,
+            path=file["filename"],
+            ref=pr_data["head"]["sha"]
+        )
+
+# 3. Run AI review (using context from Mem0, Neo4j, MCP integrations)
+review_body = await ai_service.review_pr(
+    diff=diff,
+    files=files,
+    context=review_context,
+)
+
+# 4. Post review back to GitHub
+await github_client.post_pr_comment(
+    owner, repo, pr_number,
+    comment=review_body,
+    token=user_oauth_token,
+)
+
+# 5. Index PR in Neo4j knowledge graph
+await graph_builder.index_pull_request(
+    repo_full_name=f"{owner}/{repo}",
+    pr_number=pr_number,
+    pr_data=pr_data,
+    files=[f["filename"] for f in files],
+)
+```
+
+## API Rate Limits
+
+<Warning>
+  GitHub's API has rate limits:
+  - **Authenticated requests**: 5,000/hour
+  - **Unauthenticated requests**: 60/hour
+  
+  The client uses authenticated requests (via OAuth token or PAT) to get the higher limit.
+</Warning>
+
+### Rate Limit Headers
+
+GitHub includes rate limit info in every response:
+
+```
+X-RateLimit-Limit: 5000
+X-RateLimit-Remaining: 4999
+X-RateLimit-Reset: 1372700873  # Unix timestamp
+```
+
+The client currently does not implement automatic rate limit handling. Consider adding:
+
+```python
+if int(response.headers.get("X-RateLimit-Remaining", 100)) < 10:
+    logger.warning("GitHub API rate limit nearly exhausted")
+    # Implement backoff or queue strategy
+```
+
+## Troubleshooting
+
+### Webhook Not Receiving Events
+
+1. **Check webhook status in GitHub repo settings**
+   - Go to `Settings → Webhooks`
+   - Click on your webhook
+   - Check "Recent Deliveries" for failed attempts
+
+2. **Verify webhook secret matches**
+   ```sql
+   SELECT webhook_secret FROM installations WHERE repo_full_name = 'owner/repo';
+   ```
+
+3. **Test webhook endpoint manually**
+   ```bash
+   curl -X POST https://your-app.railway.app/api/v1/webhooks/github \
+     -H "X-Hub-Signature-256: sha256=..." \
+     -H "X-GitHub-Event: pull_request" \
+     -d @webhook-payload.json
+   ```
+
+### Reviews Not Posting
+
+1. **Check OAuth token validity**
+   ```python
+   # Token might be expired or revoked
+   try:
+       test_resp = await github_client.get_pull_request(owner, repo, 1)
+   except httpx.HTTPStatusError as e:
+       if e.response.status_code == 401:
+           logger.error("GitHub token invalid or expired")
+   ```
+
+2. **Verify repo permissions**
+   - OAuth token needs `repo` scope for private repos
+   - PAT needs `repo` scope
+
+3. **Check API response for errors**
+   ```python
+   response = await github_client.post_pr_comment(...)
+   # GitHub returns 422 for validation errors (e.g., PR already closed)
+   ```
+
+## Related Files
+
+- `app/integrations/github/client.py:38` - GithubClient implementation
+- `app/integrations/github/webhook_manager.py:10` - Webhook install/uninstall
+- `app/api/v1/webhooks.py:41` - Webhook receiver endpoint
+- `app/auth/router.py` - OAuth flow
+- `app/auth/token_encryption.py` - Token encryption utilities

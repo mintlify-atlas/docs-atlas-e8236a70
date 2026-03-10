@@ -1,80 +1,409 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get Nectr up and running in under 10 minutes
+icon: rocket
 ---
 
-## Get started in three steps
+This guide will take you from zero to your first AI-powered PR review. By the end, Nectr will automatically review every pull request opened on your connected repositories.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+- A GitHub account with access to the repositories you want to review
+- Access to create OAuth apps in GitHub
+- API keys for the required services (see below)
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Nectr is designed to be self-hosted. You own your data, your API keys, and your infrastructure.
 </Note>
+
+## Overview
+
+Nectr requires five core services:
+
+<Steps>
+  <Step title="Railway (Backend)">
+    Hosts the FastAPI backend that orchestrates PR reviews
+  </Step>
+  
+  <Step title="Vercel (Frontend)">
+    Hosts the Next.js dashboard for managing repos and viewing analytics
+  </Step>
+  
+  <Step title="Neo4j (Knowledge Graph)">
+    Tracks file ownership, developer expertise, and related PRs
+  </Step>
+  
+  <Step title="Mem0 (Semantic Memory)">
+    Remembers per-project patterns and per-developer habits
+  </Step>
+  
+  <Step title="Anthropic Claude">
+    Powers the AI analysis with Claude Sonnet 4.6
+  </Step>
+</Steps>
+
+---
+
+## Step 1: Get Your API Keys
+
+<Steps>
+  <Step title="Anthropic API Key">
+    1. Go to [console.anthropic.com](https://console.anthropic.com)
+    2. Create an account or sign in
+    3. Generate a new API key
+    4. Copy the key (starts with `sk-ant-`)
+    
+    <Tip>
+    Nectr uses Claude Sonnet 4.6 (`claude-sonnet-4-5-20250929`) for PR reviews.
+    </Tip>
+  </Step>
+  
+  <Step title="Neo4j Cloud Instance">
+    1. Visit [neo4j.com/cloud/platform/aura-graph-database](https://neo4j.com/cloud/platform/aura-graph-database/)
+    2. Create a free tier instance
+    3. Note your connection URI (starts with `neo4j+s://`)
+    4. Save your username (default: `neo4j`) and password
+    
+    <Warning>
+    Save your Neo4j password immediately - it's only shown once during instance creation.
+    </Warning>
+  </Step>
+  
+  <Step title="Mem0 API Key">
+    1. Go to [mem0.ai](https://mem0.ai)
+    2. Sign up for an account
+    3. Generate an API key
+    4. Copy the key (starts with `m0-`)
+  </Step>
+  
+  <Step title="GitHub Personal Access Token">
+    1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
+    2. Click **Generate new token** → **Classic**
+    3. Select scope: `repo` (full control of private repositories)
+    4. Generate and copy the token (starts with `ghp_`)
+    
+    <Note>
+    This token is used by Nectr to post PR review comments on your behalf.
+    </Note>
+  </Step>
+  
+  <Step title="PostgreSQL Database">
+    1. Go to [supabase.com](https://supabase.com) and create a free project
+    2. Navigate to **Database** → **Connection Pooling**
+    3. Select **Session Mode** (port 5432)
+    4. Copy the connection string
+    5. Convert to async format:
+    
+    ```bash
+    # Supabase gives you:
+    postgresql://postgres.<project-id>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+    
+    # Change to:
+    postgresql+asyncpg://postgres.<project-id>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Step 2: Create GitHub OAuth App
+
+<Steps>
+  <Step title="Register OAuth App">
+    1. Go to [github.com/settings/developers](https://github.com/settings/developers)
+    2. Click **New OAuth App**
+    3. Fill in the following:
+       - **Application name**: Nectr AI PR Review
+       - **Homepage URL**: `https://your-app.vercel.app` (use your actual Vercel URL)
+       - **Authorization callback URL**: `https://your-backend.up.railway.app/auth/github/callback`
+    4. Click **Register application**
+  </Step>
+  
+  <Step title="Get Client Credentials">
+    1. Copy the **Client ID**
+    2. Click **Generate a new client secret**
+    3. Copy the **Client Secret** immediately (it's only shown once)
+  </Step>
+</Steps>
+
+<Warning>
+The callback URL must point to your Railway backend, not Vercel. This is where GitHub redirects after OAuth.
+</Warning>
+
+---
+
+## Step 3: Deploy Backend to Railway
+
+<Steps>
+  <Step title="Create Railway Project">
+    1. Go to [railway.app](https://railway.app) and sign in
+    2. Click **New Project** → **Deploy from GitHub repo**
+    3. Select your forked Nectr repository
+    4. Choose the root directory (backend is in the root)
+  </Step>
+  
+  <Step title="Configure Environment Variables">
+    In Railway's **Variables** tab, add the following:
+    
+    ```bash
+    # AI
+    ANTHROPIC_API_KEY=sk-ant-...
+    ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+    
+    # Database
+    DATABASE_URL=postgresql+asyncpg://...
+    
+    # GitHub OAuth
+    GITHUB_CLIENT_ID=your_client_id
+    GITHUB_CLIENT_SECRET=your_client_secret
+    GITHUB_PAT=ghp_...
+    
+    # Auth
+    SECRET_KEY=your_random_secret_key
+    
+    # Neo4j
+    NEO4J_URI=neo4j+s://xxx.databases.neo4j.io
+    NEO4J_USERNAME=neo4j
+    NEO4J_PASSWORD=your_password
+    
+    # Mem0
+    MEM0_API_KEY=m0-...
+    
+    # URLs (update after deployment)
+    BACKEND_URL=https://your-app.up.railway.app
+    FRONTEND_URL=https://your-app.vercel.app
+    
+    # App Config
+    APP_ENV=production
+    LOG_LEVEL=INFO
+    ```
+    
+    <Tip>
+    Generate a secure `SECRET_KEY` with: `python -c "import secrets; print(secrets.token_hex(32))"`
+    </Tip>
+  </Step>
+  
+  <Step title="Deploy">
+    Railway will automatically deploy your backend. Once complete:
+    
+    1. Copy your Railway URL (e.g., `https://nectr-production.up.railway.app`)
+    2. Update `BACKEND_URL` in Railway variables
+    3. Redeploy if necessary
+  </Step>
+</Steps>
+
+---
+
+## Step 4: Deploy Frontend to Vercel
+
+<Steps>
+  <Step title="Create Vercel Project">
+    1. Go to [vercel.com](https://vercel.com) and sign in
+    2. Click **Add New** → **Project**
+    3. Import your forked Nectr repository
+    4. Set **Root Directory** to `nectr-web`
+  </Step>
+  
+  <Step title="Configure Environment Variables">
+    Add the following environment variable:
+    
+    ```bash
+    NEXT_PUBLIC_API_URL=https://your-app.up.railway.app
+    ```
+    
+    <Note>
+    Replace with your actual Railway backend URL from Step 3.
+    </Note>
+  </Step>
+  
+  <Step title="Deploy">
+    Click **Deploy**. Vercel will build and deploy your Next.js frontend.
+  </Step>
+</Steps>
+
+---
+
+## Step 5: Connect Your First Repository
+
+<Steps>
+  <Step title="Open Dashboard">
+    1. Navigate to your Vercel URL (e.g., `https://your-app.vercel.app`)
+    2. Click **Sign in with GitHub**
+    3. Authorize the OAuth app
+  </Step>
+  
+  <Step title="Connect a Repository">
+    1. Go to **Repos** in the sidebar
+    2. Click **Connect Repository**
+    3. Select a repository from the list
+    4. Click **Install**
+    
+    This will:
+    - Install a webhook on the repository
+    - Build the initial Neo4j knowledge graph
+    - Index all files and contributors
+  </Step>
+  
+  <Step title="Open a Pull Request">
+    1. Create a new branch in your connected repository
+    2. Make some changes and push
+    3. Open a pull request on GitHub
+    
+    Within 30 seconds, Nectr will post a structured review comment on your PR.
+  </Step>
+</Steps>
+
+---
+
+## What Happens Next?
+
+When a PR is opened or updated, Nectr automatically:
+
+<Steps>
+  <Step title="Receives Webhook">
+    GitHub sends a webhook event to `/api/v1/webhooks/github`
+  </Step>
+  
+  <Step title="Fetches Context">
+    - Pulls PR diff and changed files
+    - Queries Neo4j for file experts and related PRs
+    - Retrieves project patterns and developer habits from Mem0
+    - (Optional) Fetches linked Linear issues, Sentry errors, and Slack messages
+  </Step>
+  
+  <Step title="AI Analysis">
+    Claude Sonnet 4.6 analyzes the PR for:
+    - **Bugs**: Logic errors, edge cases, race conditions
+    - **Security**: Injection risks, exposed secrets, auth issues
+    - **Performance**: N+1 queries, memory leaks, inefficient algorithms
+    - **Style**: Code consistency, naming conventions, best practices
+  </Step>
+  
+  <Step title="Posts Review">
+    - Posts a structured comment on GitHub with:
+      - Executive summary
+      - Verdict (APPROVE / REQUEST_CHANGES / COMMENT)
+      - Inline suggestions for each file
+      - Severity ratings (🔴 critical, 🟡 moderate, 🟢 minor)
+  </Step>
+  
+  <Step title="Learns & Remembers">
+    - Indexes PR in Neo4j knowledge graph
+    - Extracts and stores memories in Mem0:
+      - Project patterns (e.g., "Always use prepared statements for SQL")
+      - Developer strengths (e.g., "Alice excels at React hooks")
+      - Risk modules (e.g., "auth/ is security-critical")
+  </Step>
+</Steps>
+
+---
+
+## Example Review Output
+
+Here's what a typical Nectr review looks like:
+
+```markdown
+## 🤖 Nectr AI Review
+
+### Verdict: REQUEST_CHANGES
+
+**Summary**: This PR adds user authentication but introduces a SQL injection vulnerability and skips input validation.
+
+---
+
+### Critical Issues 🔴
+
+#### 1. SQL Injection Risk in `auth.py:45`
+
+```python
+# Current (UNSAFE)
+query = f"SELECT * FROM users WHERE email = '{email}'"
+
+# Suggested fix
+query = "SELECT * FROM users WHERE email = %s"
+cursor.execute(query, (email,))
+```
+
+**Why**: Direct string interpolation allows attackers to inject malicious SQL.
+
+---
+
+### Moderate Issues 🟡
+
+#### 2. Missing Rate Limiting on `/login`
+
+The login endpoint has no rate limiting, making it vulnerable to brute-force attacks.
+
+**Suggested fix**: Add `@limiter.limit("5 per minute")` decorator.
+
+---
+
+### Minor Issues 🟢
+
+#### 3. Inconsistent Error Messages
+
+Some endpoints return `{"error": ...}`, others return `{"message": ...}`.
+
+**Context**: This project uses `{"error": ...}` consistently (see `api/v1/users.py`).
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Add MCP Integrations" icon="link" href="/integrations/mcp-overview">
+    Connect Linear, Sentry, and Slack for richer context
+  </Card>
+  
+  <Card title="Configure Memory" icon="brain" href="/features/semantic-memory">
+    Customize project patterns and coding rules
+  </Card>
+  
+  <Card title="View Analytics" icon="chart-line" href="/api/analytics/summary">
+    Track team performance and review metrics
+  </Card>
+  
+  <Card title="Enable Parallel Agents" icon="bolt" href="/configuration/feature-flags">
+    Run 3 specialized agents for deeper analysis
+  </Card>
+</CardGroup>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Webhook not triggering">
+    1. Check Railway logs for incoming webhook events
+    2. Verify webhook is installed: `GET /api/v1/repos` should show `is_installed: true`
+    3. Check webhook secret matches in Railway env vars
+    4. Test webhook manually in GitHub repo settings → Webhooks → Recent Deliveries
+  </Accordion>
+  
+  <Accordion title="Review posted but empty">
+    1. Check Railway logs for errors during PR processing
+    2. Verify `ANTHROPIC_API_KEY` is set and valid
+    3. Ensure Neo4j and Mem0 credentials are correct
+    4. Check `GITHUB_PAT` has `repo` scope
+  </Accordion>
+  
+  <Accordion title="OAuth login fails">
+    1. Verify `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` match your OAuth app
+    2. Check callback URL in GitHub OAuth app matches `{BACKEND_URL}/auth/github/callback`
+    3. Ensure `FRONTEND_URL` and `BACKEND_URL` are set correctly in Railway
+    4. Check CORS settings in `app/main.py`
+  </Accordion>
+  
+  <Accordion title="Database connection errors">
+    1. Verify `DATABASE_URL` starts with `postgresql+asyncpg://`
+    2. Check Supabase connection pooling is enabled (Session Mode, port 5432)
+    3. Test connection: `railway run python -c "from app.core.database import engine; import asyncio; asyncio.run(engine.connect())"`
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+For more help, check the [Installation Guide](/installation) for detailed setup instructions.
+</Tip>

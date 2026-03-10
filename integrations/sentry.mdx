@@ -1,0 +1,590 @@
+---
+title: "Sentry Integration"
+description: "Surface production errors related to changed files during PR reviews via MCP"
+---
+
+## Overview
+
+The Sentry integration allows Nectr to pull production error data during PR reviews. When reviewing a PR, Nectr checks Sentry for recent errors related to the files being changed, helping reviewers understand:
+
+- **Does this PR fix a known production issue?**
+- **Are the changed files causing errors in production?**
+- **Should this PR include additional error handling based on real incidents?**
+
+<Note>
+  This is an **inbound MCP integration** — Nectr acts as an MCP client connecting to a Sentry MCP server.
+</Note>
+
+## How It Works
+
+<Steps>
+  <Step title="PR modifies files">
+    Developer submits a PR changing `app/services/auth.py` and `app/api/login.py`
+  </Step>
+  
+  <Step title="Nectr extracts changed files">
+    During PR review, Nectr parses the PR diff to identify modified file paths
+  </Step>
+  
+  <Step title="MCP query to Sentry">
+    For each critical file, Nectr calls the Sentry MCP server:
+    ```python
+    sentry_errors = await mcp_client.get_sentry_errors(
+        project="backend",
+        filename="app/services/auth.py",
+    )
+    ```
+  </Step>
+  
+  <Step title="Context included in review">
+    Sentry error data is injected into the AI review prompt:
+    ```
+    SENTRY ERRORS:
+    - ValueError in auth.py:145 (last seen 2 hours ago, 47 occurrences)
+      Culprit: get_user_token()
+      Last seen: 2026-03-10T12:30:00Z
+    ```
+  </Step>
+  
+  <Step title="AI review considers error context">
+    Claude can now:
+    - Verify if the PR fixes the reported error
+    - Suggest additional error handling based on production incidents
+    - Flag if changes might introduce new error patterns
+  </Step>
+</Steps>
+
+## Setup
+
+### 1. Deploy Sentry MCP Server
+
+You need a Sentry MCP server running separately from Nectr.
+
+**Build your own Sentry MCP server:**
+
+```python
+# sentry_mcp_server.py
+from fastapi import FastAPI
+from mcp.server.fastmcp import FastMCP
+import httpx
+import os
+
+mcp = FastMCP("Sentry")
+
+@mcp.tool()
+async def search_errors(project: str, filename: str) -> list[dict]:
+    """Search recent Sentry errors for a specific file.
+    
+    Args:
+        project: Sentry project slug (e.g., "backend")
+        filename: File path to filter errors by (e.g., "app/services/auth.py")
+    
+    Returns:
+        List of recent errors with title, culprit, count, last_seen
+    """
+    sentry_org = os.getenv("SENTRY_ORG", "your-org")
+    auth_token = os.getenv("SENTRY_AUTH_TOKEN")
+    
+    # Query Sentry API for recent issues
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://sentry.io/api/0/projects/{sentry_org}/{project}/issues/",
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+            },
+            params={
+                "query": f"file:\"{filename}\"",  # Filter by file path
+                "statsPeriod": "7d",  # Last 7 days
+                "limit": 10,
+            },
+        )
+        resp.raise_for_status()
+        issues = resp.json()
+    
+    # Format for MCP response
+    return [
+        {
+            "id": issue["id"],
+            "title": issue["title"],
+            "culprit": issue.get("culprit", "Unknown"),
+            "count": issue.get("count", 0),
+            "last_seen": issue.get("lastSeen"),
+            "status": issue.get("status"),
+            "level": issue.get("level"),
+            "permalink": issue.get("permalink"),
+        }
+        for issue in issues
+    ]
+
+app = FastAPI()
+app.mount("/mcp", mcp.sse_app())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)
+```
+
+### 2. Get Sentry Auth Token
+
+<Steps>
+  <Step title="Go to Sentry settings">
+    Navigate to [sentry.io/settings/account/api/auth-tokens/](https://sentry.io/settings/account/api/auth-tokens/)
+  </Step>
+  
+  <Step title="Create new auth token">
+    Click "Create New Token" and give it a name like "Nectr MCP"
+  </Step>
+  
+  <Step title="Set scopes">
+    Required scopes:
+    - `project:read`
+    - `event:read`
+  </Step>
+  
+  <Step title="Copy the token">
+    Format: `sntrys_...` (starts with `sntrys_`)
+  </Step>
+</Steps>
+
+### 3. Configure Nectr
+
+Set environment variables in your Nectr backend:
+
+```env
+# Sentry MCP server base URL
+SENTRY_MCP_URL=https://your-sentry-mcp-server.railway.app
+
+# Sentry auth token (passed to MCP server via Authorization header)
+SENTRY_AUTH_TOKEN=sntrys_...
+```
+
+<Warning>
+  Both `SENTRY_MCP_URL` and `SENTRY_AUTH_TOKEN` must be set for the integration to work. If either is missing, Sentry context will be silently skipped.
+</Warning>
+
+## API Reference
+
+### `MCPClientManager.get_sentry_errors()`
+
+Get recent Sentry errors related to a file being reviewed.
+
+**Source:** `app/mcp/client.py:72`
+
+**Signature:**
+```python
+async def get_sentry_errors(
+    self,
+    project: str,
+    filename: str,
+) -> list[dict]:
+```
+
+**Parameters:**
+- `project` (str): Sentry project slug (e.g., `"backend"`, `"frontend"`, `"api"`)
+- `filename` (str): File path from the PR diff to filter errors by (e.g., `"app/services/auth.py"`)
+
+**Returns:**
+```python
+[
+    {
+        "id": "123456789",
+        "title": "ValueError: Invalid token format",
+        "culprit": "app.services.auth.get_user_token()",
+        "count": 47,
+        "last_seen": "2026-03-10T12:30:00Z",
+        "status": "unresolved",
+        "level": "error",
+        "permalink": "https://sentry.io/organizations/org/issues/123456789/",
+    }
+]
+```
+
+Returns empty list `[]` if:
+- `SENTRY_MCP_URL` is not configured
+- Sentry MCP server is unreachable
+- MCP call times out (10-second timeout)
+- No errors found for the file in the last 7 days
+
+**Example Usage:**
+```python
+from app.mcp.client import mcp_client
+
+# During PR review
+changed_files = ["app/services/auth.py", "app/api/login.py"]
+
+# Check Sentry for errors in the first changed file
+if changed_files:
+    errors = await mcp_client.get_sentry_errors(
+        project="backend",
+        filename=changed_files[0],
+    )
+
+    if errors:
+        print(f"Found {len(errors)} recent errors in {changed_files[0]}")
+        for error in errors:
+            print(f"  - {error['title']} ({error['count']} occurrences)")
+            print(f"    Last seen: {error['last_seen']}")
+            print(f"    URL: {error['permalink']}")
+```
+
+## MCP Protocol Details
+
+Nectr calls the Sentry MCP server using JSON-RPC 2.0 over HTTP:
+
+### Request Format
+
+```json
+POST https://sentry-mcp-server.example.com/
+Content-Type: application/json
+Authorization: Bearer sntrys_...
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search_errors",
+    "arguments": {
+      "project": "backend",
+      "filename": "app/services/auth.py"
+    }
+  }
+}
+```
+
+### Response Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "[{\"id\": \"123456789\", \"title\": \"ValueError: Invalid token format\", ...}]"
+      }
+    ]
+  }
+}
+```
+
+Nectr's `MCPClientManager` unwraps this format automatically (see [MCP Overview](/integrations/mcp-overview#mcp-protocol-details)).
+
+## Timeout and Error Handling
+
+The Sentry MCP client has a **10-second timeout** to prevent slow external services from blocking PR reviews.
+
+```python
+_MCP_TIMEOUT = 10.0  # seconds
+
+try:
+    async with httpx.AsyncClient(timeout=_MCP_TIMEOUT) as client:
+        response = await client.post(...)
+        response.raise_for_status()
+except httpx.TimeoutException:
+    logger.warning(
+        f"MCP call timed out: {settings.SENTRY_MCP_URL} tool=search_errors"
+    )
+    return []  # Empty list - review continues without Sentry context
+except httpx.HTTPStatusError as exc:
+    logger.warning(f"Sentry MCP returned HTTP {exc.response.status_code}")
+    return []
+except Exception as exc:
+    logger.warning(f"Sentry MCP query failed: {exc}")
+    return []
+```
+
+<Note>
+  Sentry integration is **best-effort**. If the MCP server is down or slow, PR reviews continue without Sentry context. External context should enhance reviews, not block them.
+</Note>
+
+## Usage in PR Review Flow
+
+Here's how Sentry context is pulled during a review:
+
+```python
+# 1. Extract changed files from PR
+changed_files = [f["filename"] for f in pr_files]
+
+# 2. Filter to critical files (skip tests, docs, config)
+critical_files = [
+    f for f in changed_files
+    if not f.startswith(("tests/", "docs/", ".github/"))
+    and f.endswith((".py", ".js", ".ts", ".tsx", ".go", ".rb"))
+]
+
+# 3. Pull Sentry errors for the most critical file (avoid rate limits)
+sentry_errors = []
+if critical_files:
+    sentry_errors = await mcp_client.get_sentry_errors(
+        project="backend",  # TODO: Make this configurable per repo
+        filename=critical_files[0],
+    )
+
+# 4. Format Sentry context for AI review prompt
+sentry_context = ""
+if sentry_errors:
+    sentry_context = "\n\nSENTRY ERRORS:\n"
+    for error in sentry_errors:
+        sentry_context += f"""- {error['title']}
+  File: {critical_files[0]}
+  Culprit: {error['culprit']}
+  Count: {error['count']} occurrences
+  Last seen: {error['last_seen']}
+  Status: {error['status']}
+  URL: {error['permalink']}
+"""
+
+# 5. Include in AI review
+review_prompt = f"""
+Review this pull request:
+
+PR Title: {pr_data['title']}
+Changed Files: {changed_files}
+{sentry_context}
+
+Diff:
+{pr_diff}
+
+Provide a structured review. If Sentry errors are present, verify:
+1. Does this PR fix the reported errors?
+2. Should additional error handling be added based on production incidents?
+3. Could these changes introduce similar error patterns?
+"""
+```
+
+## Example Review with Sentry Context
+
+Here's how Sentry context appears in an AI-generated review:
+
+```markdown
+# PR Review: Fix authentication token validation
+
+## Production Errors
+🚨 **Sentry found 47 errors in changed file** `app/services/auth.py`:
+
+- **ValueError: Invalid token format** (last seen 2 hours ago)
+  - Culprit: `get_user_token()` line 145
+  - 47 occurrences in last 7 days
+  - [View in Sentry](https://sentry.io/organizations/org/issues/123456789/)
+
+## Analysis
+✅ **This PR directly addresses the Sentry error!**
+
+The changes add validation for token format before attempting to decode:
+```python
++ if not token or len(token.split(".")) != 3:
++     raise ValueError("Invalid token format")
+```
+
+This should resolve the 47 occurrences reported by Sentry.
+
+## Suggestions
+1. **Add test case for the Sentry error**: Include a test that reproduces
+   the `ValueError` scenario to prevent regression.
+   
+2. **Log error details**: Consider adding structured logging when this
+   validation fails to improve debugging:
+   ```python
+   logger.warning("Invalid token format", extra={"token_length": len(token)})
+   ```
+
+3. **Monitor after deploy**: Track this Sentry issue for 24-48 hours after
+   merge to confirm the fix is effective.
+
+## Verdict
+APPROVE - Excellent fix for a real production issue. Add tests before merging.
+```
+
+## Project Configuration
+
+The Sentry project slug is currently hardcoded as `"backend"`. Make it configurable:
+
+### Per-Repository Project Mapping
+
+```python
+# Add to Installation model
+class Installation(Base):
+    # ...
+    sentry_project: str | None = None  # e.g., "backend", "frontend", "api"
+
+# Or use a mapping file
+SENTRY_PROJECT_MAP = {
+    "nectr-ai/nectr": "backend",
+    "nectr-ai/nectr-web": "frontend",
+    "nectr-ai/api": "api",
+}
+
+def get_sentry_project(repo_full_name: str) -> str:
+    return SENTRY_PROJECT_MAP.get(repo_full_name, "backend")  # Default to backend
+```
+
+### Auto-Detection from Repository Name
+
+```python
+def infer_sentry_project(repo_full_name: str) -> str:
+    """Infer Sentry project from repository name.
+    
+    Examples:
+        "nectr-ai/nectr-backend" -> "backend"
+        "nectr-ai/nectr-web" -> "frontend"
+        "nectr-ai/api-gateway" -> "api"
+    """
+    repo_name = repo_full_name.split("/")[1].lower()
+    
+    if "web" in repo_name or "frontend" in repo_name:
+        return "frontend"
+    elif "api" in repo_name:
+        return "api"
+    else:
+        return "backend"  # Default
+```
+
+## Advanced: Multi-File Error Queries
+
+For PRs changing multiple files, query Sentry for each:
+
+```python
+import asyncio
+
+# Query Sentry for all changed files (limit to avoid rate limits)
+changed_files = [f["filename"] for f in pr_files[:5]]  # Max 5 files
+
+errors_by_file = await asyncio.gather(
+    *[
+        mcp_client.get_sentry_errors(project="backend", filename=f)
+        for f in changed_files
+    ],
+    return_exceptions=True,
+)
+
+# Combine results
+all_errors = []
+for filename, errors in zip(changed_files, errors_by_file):
+    if isinstance(errors, Exception):
+        logger.warning(f"Sentry query failed for {filename}: {errors}")
+        continue
+    for error in errors:
+        error["filename"] = filename  # Track which file caused the error
+        all_errors.append(error)
+
+# Sort by error count (most frequent first)
+all_errors.sort(key=lambda e: e["count"], reverse=True)
+```
+
+## Troubleshooting
+
+### No Sentry context appearing in reviews
+
+<Steps>
+  <Step title="Check environment variables">
+    ```bash
+    echo $SENTRY_MCP_URL
+    echo $SENTRY_AUTH_TOKEN
+    ```
+    Both must be set and non-empty.
+  </Step>
+  
+  <Step title="Test Sentry MCP server directly">
+    ```bash
+    curl -X POST $SENTRY_MCP_URL \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_errors",
+          "arguments": {"project": "backend", "filename": "app/main.py"}
+        }
+      }'
+    ```
+    Should return JSON with errors (or empty array if no errors).
+  </Step>
+  
+  <Step title="Check Nectr logs">
+    ```bash
+    grep -i "sentry" /var/log/nectr/app.log
+    ```
+    Look for warnings like "SENTRY_MCP_URL not configured".
+  </Step>
+  
+  <Step title="Verify file paths match Sentry">
+    Sentry tracks file paths from stack traces. Ensure your MCP server
+    query matches Sentry's file path format (e.g., `app/services/auth.py`
+    vs `services/auth.py`).
+  </Step>
+</Steps>
+
+### Sentry returning no errors
+
+If Sentry has errors but MCP returns `[]`:
+
+1. **Check file path format**: Sentry's `file:"..."` query is exact match
+   ```python
+   # Try both formats:
+   await mcp_client.get_sentry_errors(project="backend", filename="app/services/auth.py")
+   await mcp_client.get_sentry_errors(project="backend", filename="services/auth.py")
+   ```
+
+2. **Check time window**: Default is 7 days. Increase if needed:
+   ```python
+   # In Sentry MCP server
+   params={"statsPeriod": "30d"}  # Last 30 days
+   ```
+
+3. **Test Sentry API directly**:
+   ```bash
+   curl "https://sentry.io/api/0/projects/YOUR_ORG/backend/issues/?query=file:%22app/services/auth.py%22" \
+     -H "Authorization: Bearer $SENTRY_AUTH_TOKEN"
+   ```
+
+### Authentication errors
+
+```
+HTTP 401 from Sentry MCP server
+```
+
+- **Check token format**: Should start with `sntrys_`
+- **Verify scopes**: Token needs `project:read` and `event:read` scopes
+- **Check organization access**: Token must have access to the Sentry organization
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Limit queries" icon="gauge-high">
+    Only query Sentry for critical files (skip tests, docs). Use the first 1-3 changed files to avoid rate limits.
+  </Card>
+  
+  <Card title="Cache results" icon="clock">
+    Cache Sentry results for 5-10 minutes to avoid duplicate queries for the same file.
+  </Card>
+  
+  <Card title="Filter by error level" icon="filter">
+    Focus on `error` and `fatal` level issues. Skip `warning` and `info` to reduce noise.
+  </Card>
+  
+  <Card title="Link to Sentry UI" icon="arrow-up-right-from-square">
+    Always include `permalink` in review so developers can investigate full stack traces.
+  </Card>
+</CardGroup>
+
+## Related Integrations
+
+<CardGroup cols={2}>
+  <Card title="Linear Integration" icon="list-check" href="/integrations/linear">
+    Pull linked issues and task context
+  </Card>
+  <Card title="Slack Integration" icon="slack" href="/integrations/slack">
+    Include relevant team messages in review context
+  </Card>
+</CardGroup>
+
+## Related Files
+
+- `app/mcp/client.py:72` - `get_sentry_errors()` implementation
+- `app/mcp/client.py:118` - Generic `query_mcp_server()` method
+- `app/services/pr_review_service.py` - How Sentry context is used in reviews
+- `app/core/config.py:68` - `SENTRY_MCP_URL` and `SENTRY_AUTH_TOKEN` settings

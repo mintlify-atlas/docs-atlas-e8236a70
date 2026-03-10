@@ -1,0 +1,187 @@
+---
+title: "Architecture Overview"
+description: "High-level system architecture and design principles of Nectr AI PR Review Agent"
+---
+
+## System Overview
+
+Nectr is a full-stack AI code review agent built with a modern, event-driven architecture. The system consists of three main layers:
+
+1. **Frontend** - Next.js 15 + React 19 web application (Vercel)
+2. **Backend** - FastAPI + Uvicorn Python application (Railway)
+3. **Data Layer** - PostgreSQL, Neo4j knowledge graph, and Mem0 semantic memory
+
+<Note>
+  Nectr uses an **agentic review approach** where Claude fetches only the context it needs via tools, rather than receiving all context upfront. This keeps reviews focused and reduces noise.
+</Note>
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                             NECTR ARCHITECTURE                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────┐     OAuth      ┌───────────────────────────────────────────────────┐
+  │Developer │ ─────────────► │             FRONTEND (Vercel)                     │
+  │  Browser │ ◄───────────── │          Next.js 15 + React 19                    │
+  └──────────┘   JWT Cookie   │  /dashboard  /repos  /reviews  /analytics  /team  │
+                              └──────────────────────┬────────────────────────────┘
+                                                     │ REST API (axios, withCredentials)
+                                                     ▼
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                             BACKEND (Railway)                                      │
+│                           FastAPI + Uvicorn                                        │
+│                                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                             API ROUTES                                       │  │
+│  │  /auth/github            GitHub OAuth flow                                   │  │
+│  │  /api/v1/webhooks        GitHub webhook receiver (per-repo)                  │  │
+│  │  /api/v1/repos           Connect / disconnect / rescan repos (no redirect)   │  │
+│  │  /api/v1/reviews         PR review history                                   │  │
+│  │  /api/v1/analytics       Team metrics & dashboards                           │  │
+│  │  /api/v1/memory          Mem0 CRUD + project map                             │  │
+│  │  /health                 Status check (DB + Neo4j)                           │  │
+│  │  /mcp/sse                MCP SSE stream  (GET — server → client events)      │  │
+│  │  /mcp/messages           MCP JSON-RPC    (POST — client → server)            │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                    │
+│  ┌─────────────────────┐  ┌──────────────────────┐  ┌──────────────────────────┐  │
+│  │  pr_review_         │  │  context_service     │  │      ai_service          │  │
+│  │  service.py         │  │  (builds context     │  │  (Claude Sonnet 4.6)     │  │
+│  │  (orchestrator)     │  │  from Neo4j + Mem0   │  │  agentic loop OR         │  │
+│  │                     │  │  + MCP integrations) │  │  3 parallel agents)      │  │
+│  └──────────┬──────────┘  └──────────────────────┘  └──────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────────────────┘
+         │           │             │              │               │
+         ▼           ▼             ▼              ▼               ▼
+   ┌──────────┐ ┌─────────┐ ┌──────────┐  ┌──────────┐   ┌────────────┐
+   │PostgreSQL│ │  Neo4j  │ │  Mem0    │  │Anthropic │   │  GitHub    │
+   │(Railway) │ │  Graph  │ │ Memory   │  │  Claude  │   │  REST API  │
+   └──────────┘ └─────────┘ └──────────┘  └──────────┘   └────────────┘
+```
+
+## Core Components
+
+<Card title="PR Review Service" icon="code" href="/architecture/services#pr-review-service">
+  Orchestrates the full PR review workflow from webhook to GitHub comment
+</Card>
+
+<Card title="AI Service" icon="brain" href="/architecture/services#ai-service">
+  Manages Claude AI interactions with agentic tool execution
+</Card>
+
+<Card title="Context Service" icon="database" href="/architecture/services#context-service">
+  Builds review context from Neo4j graph and Mem0 memories
+</Card>
+
+<Card title="Graph Builder" icon="share-2" href="/architecture/neo4j-graph">
+  Builds and queries the Neo4j knowledge graph
+</Card>
+
+## Key Design Principles
+
+### 1. Agentic Architecture
+
+Rather than overwhelming Claude with all available context upfront, Nectr uses **tool-based agentic execution**. Claude decides what context it needs and fetches it on-demand:
+
+- `read_file` - Fetch full source code when diff isn't enough
+- `search_project_memory` - Query project patterns and decisions
+- `search_developer_memory` - Look up developer-specific patterns
+- `get_file_history` - Find file experts and related PRs
+- `get_linked_issues` - Pull Linear/GitHub issues
+- `get_related_errors` - Fetch Sentry production errors
+
+### 2. Event-Driven Processing
+
+GitHub webhook events trigger background tasks that:
+1. Return `HTTP 200` immediately (< 10s timeout)
+2. Process PR review asynchronously in background
+3. Update database with status and results
+4. Post review back to GitHub via REST API
+
+### 3. Multi-Modal Memory
+
+**Structural Memory (Neo4j)**
+- File → Developer relationships
+- PR → File touch patterns
+- Issue → PR closure links
+
+**Semantic Memory (Mem0)**
+- Project patterns and decisions
+- Developer habits and strengths
+- Risk modules and recurring issues
+
+### 4. Bidirectional MCP Integration
+
+**Outbound (Nectr as MCP Server)**
+- Exposes PR reviews, verdicts, contributor stats via MCP
+- Claude Desktop and other agents can query Nectr's data
+
+**Inbound (Nectr as MCP Client)**
+- Pulls Linear issues, Sentry errors, Slack messages
+- Enriches PR reviews with live production context
+
+## Technology Stack
+
+| Layer | Technology |
+|-------|------------|
+| **Frontend** | Next.js 15, React 19, TypeScript, TailwindCSS 4 |
+| **Backend** | FastAPI, Uvicorn, Python 3.14 |
+| **Database** | PostgreSQL (asyncpg + SQLAlchemy async) |
+| **Knowledge Graph** | Neo4j (async driver) |
+| **Semantic Memory** | Mem0 |
+| **AI Model** | Anthropic Claude Sonnet 4.6 |
+| **GitHub Integration** | GitHub OAuth + REST API + Webhooks |
+| **MCP** | FastMCP (server) + httpx MCP client |
+| **Frontend Hosting** | Vercel |
+| **Backend Hosting** | Railway |
+| **Auth** | GitHub OAuth → JWT (httpOnly, SameSite=None, Secure) |
+| **Token Encryption** | Fernet (AES-128-CBC) |
+
+## Performance Characteristics
+
+<Accordion title="Review Latency">
+  - **Webhook response**: < 1 second (returns 200 immediately)
+  - **Background processing**: 10-30 seconds (depends on PR size)
+  - **Agentic tool calls**: 3-5 rounds average, ~2s per round
+  - **Parallel agent mode**: 15-20 seconds (3 agents + synthesis)
+</Accordion>
+
+<Accordion title="Scalability">
+  - **Concurrent reviews**: Handled by FastAPI async workers
+  - **Database**: Connection pooling via SQLAlchemy
+  - **Neo4j**: Indexed queries, &lt;100ms for file experts
+  - **Rate limits**: GitHub API (5000/hour), Anthropic (tier-based)
+</Accordion>
+
+<Accordion title="Data Volume">
+  - **PostgreSQL**: ~1 KB per event, ~5 KB per workflow run
+  - **Neo4j**: ~100-500 nodes per repo, ~1000-5000 edges
+  - **Mem0**: ~10-20 memories per PR review
+</Accordion>
+
+## Security & Privacy
+
+- **Token Encryption**: GitHub access tokens encrypted with Fernet (AES-128-CBC)
+- **Webhook Verification**: HMAC-SHA256 signature validation per-repo
+- **JWT Auth**: httpOnly cookies, SameSite=None, Secure flag
+- **CORS**: Strict origin allowlist for production
+- **No Data Sharing**: All data stays in your infrastructure
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Backend Architecture" icon="server" href="/architecture/backend">
+    Dive into FastAPI service layer and API routes
+  </Card>
+  <Card title="Frontend Architecture" icon="browser" href="/architecture/frontend">
+    Explore Next.js structure and React components
+  </Card>
+  <Card title="Data Flow" icon="workflow" href="/architecture/data-flow">
+    Follow a PR review from webhook to comment
+  </Card>
+  <Card title="Neo4j Graph" icon="share-2" href="/architecture/neo4j-graph">
+    Learn about the knowledge graph schema
+  </Card>
+</CardGroup>

@@ -1,0 +1,185 @@
+---
+title: "Disconnect Repository"
+api: "DELETE /api/v1/repos/{owner}/{repo}/install"
+description: "Disconnect a repository by removing the webhook and deactivating the installation"
+---
+
+## Overview
+
+Disconnects a repository from Nectr AI by removing the GitHub webhook and marking the installation as inactive. After disconnection, PR events from this repository will no longer trigger AI reviews.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header.
+
+```
+Authorization: Bearer <token>
+```
+
+## Path Parameters
+
+<ParamField path="owner" type="string" required>
+  Repository owner (user or organization)
+</ParamField>
+
+<ParamField path="repo" type="string" required>
+  Repository name
+</ParamField>
+
+## Request
+
+<CodeGroup>
+```bash cURL
+curl -X DELETE "https://api.nectr.ai/api/v1/repos/acme/my-backend/install" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import httpx
+
+headers = {
+    "Authorization": "Bearer YOUR_JWT_TOKEN"
+}
+
+response = httpx.delete(
+    "https://api.nectr.ai/api/v1/repos/acme/my-backend/install",
+    headers=headers
+)
+result = response.json()
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://api.nectr.ai/api/v1/repos/acme/my-backend/install',
+  {
+    method: 'DELETE',
+    headers: {
+      'Authorization': 'Bearer YOUR_JWT_TOKEN'
+    }
+  }
+);
+
+const result = await response.json();
+```
+</CodeGroup>
+
+## Response
+
+<ResponseField name="status" type="string">
+  Always returns `"disconnected"` on success
+</ResponseField>
+
+<ResponseField name="repo" type="string">
+  Full repository name in `owner/repo` format
+</ResponseField>
+
+### Example Response
+
+```json
+{
+  "status": "disconnected",
+  "repo": "acme/my-backend"
+}
+```
+
+## What Happens During Disconnection
+
+### 1. Webhook Removal
+
+If the installation has a `webhook_id`, the endpoint attempts to delete the webhook from GitHub using:
+
+```http
+DELETE https://api.github.com/repos/{owner}/{repo}/hooks/{webhook_id}
+```
+
+**Graceful Degradation**: If webhook removal fails (e.g., webhook already deleted manually on GitHub, or user lost admin access), a warning is logged but the disconnection proceeds.
+
+### 2. Installation Deactivation
+
+The `Installation` record is marked as inactive:
+
+```python
+installation.is_active = False
+```
+
+The record is **not deleted** from the database, preserving historical data.
+
+### 3. Data Retention
+
+**Preserved**:
+- Installation record (marked `is_active = False`)
+- Neo4j code graph (Repository, File, PullRequest, Developer nodes)
+- Historical PR review data
+
+**Effect**:
+- No new webhook events will be processed
+- Repository will show as disconnected in `/api/v1/repos`
+- User can reconnect later without data loss
+
+## Error Responses
+
+<ResponseField name="401 Unauthorized">
+  JWT token is invalid, expired, or missing
+  
+  ```json
+  {
+    "detail": "Unauthorized"
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="401 Session Expired">
+  GitHub OAuth token cannot be decrypted (SECRET_KEY changed)
+  
+  ```json
+  {
+    "detail": "Session expired — please log out and sign in again."
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="404 Not Found">
+  No active installation found for this repository and user
+  
+  ```json
+  {
+    "detail": "Installation not found"
+  }
+  ```
+  
+  This can occur if:
+  - The repository was never connected
+  - The repository is already disconnected
+  - The repository belongs to a different user
+</ResponseField>
+
+## Webhook Removal Failure Scenarios
+
+The endpoint handles webhook deletion gracefully:
+
+| Scenario | Behavior |
+|----------|----------|
+| Webhook deleted manually on GitHub | Warning logged, disconnection succeeds |
+| User lost admin permissions | Warning logged, disconnection succeeds |
+| GitHub API unavailable | Warning logged, disconnection succeeds |
+| Network timeout | Warning logged, disconnection succeeds |
+
+In all cases, the installation is marked inactive, preventing future webhook events from being processed.
+
+## Permissions Required
+
+### GitHub OAuth Scopes
+- `repo` - Required to delete webhooks
+
+### Repository Access
+The authenticated user must have **admin** permissions on the repository to remove webhooks. If permissions are lost, webhook removal will fail gracefully.
+
+## Reconnection
+
+After disconnection, you can reconnect the same repository using the [Connect Repository](/api/repos/connect) endpoint. The previous installation record will remain inactive, and a new active installation will be created.
+
+## Related Endpoints
+
+- [List Repositories](/api/repos/list) - View connection status
+- [Connect Repository](/api/repos/connect) - Reconnect a disconnected repository
+- [Rescan Repository](/api/repos/rescan) - Rebuild the code graph for an active connection

@@ -1,0 +1,315 @@
+---
+title: 'List Memories'
+api: 'GET /api/v1/memory'
+description: 'Retrieve AI memories for a repository'
+---
+
+## Overview
+
+List all Mem0 AI memories for a specific repository. Memories capture project context, developer patterns, coding standards, and architectural decisions learned from analyzing PRs.
+
+## Authentication
+
+Requires a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+## Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository to query in `owner/repo` format (e.g., "acme/api-server")
+</ParamField>
+
+<ParamField query="memory_type" type="string" optional>
+  Filter by memory type. Valid values:
+  - `project_rule`: Project-specific guidelines and standards
+  - `contributor_profile`: Developer contribution summaries
+  - `developer_pattern`: Individual coding patterns and habits
+  - `developer_strength`: Technical areas of expertise
+  - `architecture`: System architecture and design decisions
+  - `project_map`: Codebase structure and module descriptions
+</ParamField>
+
+## Response
+
+<ResponseField name="memories" type="array">
+  Array of memory objects
+</ResponseField>
+
+<ResponseField name="memories[].id" type="string">
+  Unique memory ID
+</ResponseField>
+
+<ResponseField name="memories[].memory" type="string">
+  Memory content (text description)
+</ResponseField>
+
+<ResponseField name="memories[].metadata" type="object">
+  Additional metadata about the memory
+</ResponseField>
+
+<ResponseField name="memories[].metadata.memory_type" type="string">
+  Type of memory (project_rule, contributor_profile, etc.)
+</ResponseField>
+
+<ResponseField name="memories[].metadata.username" type="string">
+  Associated GitHub username (for developer-specific memories)
+</ResponseField>
+
+<ResponseField name="memories[].metadata.source_pr" type="integer">
+  PR number where this memory was learned
+</ResponseField>
+
+<ResponseField name="memories[].metadata.pr_count" type="integer">
+  Number of PRs analyzed (for contributor profiles)
+</ResponseField>
+
+<ResponseField name="memories[].metadata.commit_count" type="integer">
+  Total commits (for contributor profiles)
+</ResponseField>
+
+<ResponseField name="count" type="integer">
+  Total number of memories returned
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X GET "https://api.nectr.ai/api/v1/memory?repo=acme/api-server" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```bash cURL (Filtered)
+curl -X GET "https://api.nectr.ai/api/v1/memory?repo=acme/api-server&memory_type=project_rule" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+```python Python
+import requests
+
+response = requests.get(
+    "https://api.nectr.ai/api/v1/memory",
+    headers={"Authorization": f"Bearer {token}"},
+    params={"repo": "acme/api-server"}
+)
+
+data = response.json()
+print(f"Found {data['count']} memories")
+for memory in data['memories'][:5]:
+    print(f"- {memory['metadata']['memory_type']}: {memory['memory'][:100]}...")
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://api.nectr.ai/api/v1/memory?repo=acme/api-server&memory_type=project_rule',
+  {
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  }
+);
+
+const data = await response.json();
+console.log(`Found ${data.count} project rules`);
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "memories": [
+    {
+      "id": "mem_a1b2c3d4e5",
+      "memory": "All API endpoints must include comprehensive error handling with custom exception classes that inherit from BaseAPIException.",
+      "metadata": {
+        "memory_type": "project_rule",
+        "source_pr": 42,
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_f6g7h8i9j0",
+      "memory": "Database migrations must include both upgrade and downgrade scripts. Never modify existing migrations.",
+      "metadata": {
+        "memory_type": "project_rule",
+        "source_pr": 38,
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_k1l2m3n4o5",
+      "memory": "Experienced backend developer focused on API design. Consistently delivers well-tested code with comprehensive documentation.",
+      "metadata": {
+        "memory_type": "contributor_profile",
+        "username": "johndoe",
+        "pr_count": 47,
+        "commit_count": 312,
+        "repo": "acme/api-server"
+      }
+    },
+    {
+      "id": "mem_p6q7r8s9t0",
+      "memory": "Prefers async/await patterns for all database operations. Always uses SQLAlchemy async session management.",
+      "metadata": {
+        "memory_type": "developer_pattern",
+        "username": "johndoe",
+        "source_pr": 45,
+        "repo": "acme/api-server"
+      }
+    }
+  ],
+  "count": 4
+}
+```
+
+## Memory Types
+
+### project_rule
+Project-specific coding standards, architectural guidelines, and best practices that all contributors should follow.
+
+**Example:**
+```
+"All authentication endpoints must use JWT tokens with 15-minute expiration and refresh token rotation."
+```
+
+### contributor_profile
+High-level summary of a developer's contribution style and expertise, generated from analyzing their PR history.
+
+**Example:**
+```
+"Senior frontend engineer specializing in React and TypeScript. Known for creating accessible, performant user interfaces."
+```
+
+### developer_pattern
+Specific coding patterns, habits, and preferences identified for individual developers.
+
+**Example:**
+```
+"Favors functional React components with custom hooks. Always implements comprehensive unit tests using React Testing Library."
+```
+
+### developer_strength
+Technical areas where a developer demonstrates expertise.
+
+**Example:**
+```
+"Database schema design and query optimization. Expert in PostgreSQL performance tuning."
+```
+
+### architecture
+High-level system architecture decisions and design patterns used in the codebase.
+
+**Example:**
+```
+"Microservices architecture with event-driven communication using RabbitMQ. Each service has independent database."
+```
+
+### project_map
+Codebase structure, module descriptions, and file organization patterns.
+
+**Example:**
+```
+"app/api/v1/ contains all REST API endpoints organized by resource type (users, reviews, analytics)."
+```
+
+## Error Responses
+
+### Repository Not Connected
+
+```json
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+HTTP Status: `403 Forbidden`
+
+## Use Cases
+
+### Display Project Rules
+
+```python
+data = list_memories(repo="acme/api-server", memory_type="project_rule")
+
+print("📋 Project Coding Standards:")
+for i, memory in enumerate(data['memories'], 1):
+    print(f"{i}. {memory['memory']}")
+    if 'source_pr' in memory['metadata']:
+        print(f"   (Learned from PR #{memory['metadata']['source_pr']})")
+```
+
+### Developer Onboarding
+
+```python
+def generate_onboarding_guide(repo):
+    # Get project structure
+    project_map = list_memories(repo=repo, memory_type="project_map")
+    
+    # Get coding standards
+    rules = list_memories(repo=repo, memory_type="project_rule")
+    
+    # Get architecture overview
+    architecture = list_memories(repo=repo, memory_type="architecture")
+    
+    guide = "# Developer Onboarding Guide\n\n"
+    
+    guide += "## Project Structure\n"
+    for mem in project_map['memories']:
+        guide += f"- {mem['memory']}\n"
+    
+    guide += "\n## Architecture\n"
+    for mem in architecture['memories']:
+        guide += f"- {mem['memory']}\n"
+    
+    guide += "\n## Coding Standards\n"
+    for mem in rules['memories']:
+        guide += f"- {mem['memory']}\n"
+    
+    return guide
+```
+
+### Context for AI Code Review
+
+```python
+def get_review_context(repo):
+    """Build context for AI reviewer from memories."""
+    rules = list_memories(repo=repo, memory_type="project_rule")
+    architecture = list_memories(repo=repo, memory_type="architecture")
+    
+    context = "Project Context:\n\n"
+    context += "Coding Standards:\n"
+    for mem in rules['memories']:
+        context += f"- {mem['memory']}\n"
+    
+    context += "\nArchitecture:\n"
+    for mem in architecture['memories']:
+        context += f"- {mem['memory']}\n"
+    
+    return context
+```
+
+### Team Knowledge Base
+
+```python
+from collections import defaultdict
+
+data = list_memories(repo="acme/api-server")
+
+by_type = defaultdict(list)
+for memory in data['memories']:
+    memory_type = memory['metadata'].get('memory_type', 'unknown')
+    by_type[memory_type].append(memory)
+
+print("📚 Team Knowledge Base\n")
+for memory_type, memories in by_type.items():
+    print(f"## {memory_type.replace('_', ' ').title()} ({len(memories)})")
+    for mem in memories[:3]:
+        print(f"  - {mem['memory'][:100]}...")
+    print()
+```

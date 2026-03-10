@@ -1,0 +1,504 @@
+---
+title: "MCP Overview"
+description: "Bidirectional integration via Model Context Protocol - Nectr as both MCP server and client"
+---
+
+## What is MCP?
+
+The **Model Context Protocol (MCP)** is a standard for connecting AI applications with external data sources. Nectr implements MCP bidirectionally:
+
+<CardGroup cols={2}>
+  <Card title="Nectr as MCP Server" icon="arrow-up-from-bracket">
+    External agents (Claude Desktop, Linear, custom tools) can query Nectr's review data, contributor stats, and repo health metrics
+  </Card>
+  <Card title="Nectr as MCP Client" icon="arrow-down-to-bracket">
+    Nectr pulls live context from Linear (issues), Sentry (errors), and Slack (messages) during PR reviews
+  </Card>
+</CardGroup>
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NECTR MCP ARCHITECTURE                       │
+└─────────────────────────────────────────────────────────────────┘
+
+  OUTBOUND (Nectr as MCP Server)     INBOUND (Nectr as MCP Client)
+  ──────────────────────────────     ───────────────────────────────
+
+  ┌────────────────┐                  ┌──────────────────┐
+  │ Claude Desktop │                  │  Linear MCP      │
+  │  Linear Bot    │                  │  Server          │
+  │  Custom Agents │                  │  ↓               │
+  └────────┬───────┘                  │  search_issues   │
+           │                          └────────┬─────────┘
+           │ GET /mcp/sse                      │
+           │ POST /mcp/messages                │
+           ↓                                   │
+  ┌──────────────────────────────┐            │
+  │   Nectr FastMCP Server       │            |
+  │   (app/mcp/server.py)        │            │
+  │                              │            │
+  │   Tools:                     │            │
+  │   • get_recent_reviews       │            │
+  │   • get_contributor_stats    │            │
+  │   • get_pr_verdict           │            │
+  │   • get_repo_health          │            │
+  │                              │            │
+  │   Resources:                 │            │
+  │   • nectr://repos/{repo}/... │            │
+  └──────────────────────────────┘            │
+                                              │
+                                              ↓
+  ┌─────────────────────────────────────────────────────┐
+  │         Nectr PR Review Service                     │
+  │         (app/services/pr_review_service.py)         │
+  │                                                     │
+  │   During review, pulls context from:                │
+  │   • Linear: linked issues, task descriptions        │
+  │   • Sentry: production errors for changed files     │
+  │   • Slack: relevant channel messages                │
+  │                                                     │
+  │   ↓ MCPClientManager (app/mcp/client.py)           │
+  └─────────────────────────────────────────────────────┘
+                    │         │         │
+                    ↓         ↓         ↓
+           ┌────────────┬──────────┬──────────┐
+           │  Linear    │  Sentry  │  Slack   │
+           │  MCP       │  MCP     │  MCP     │
+           │  Server    │  Server  │  Server  │
+           └────────────┴──────────┴──────────┘
+```
+
+## Nectr as MCP Server (Outbound)
+
+Nectr exposes its review data as an MCP server using **FastMCP** with SSE (Server-Sent Events) transport.
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp/sse` | GET | SSE stream for server → client events |
+| `/mcp/messages` | POST | JSON-RPC 2.0 message ingestion |
+
+### Available Tools
+
+#### `get_recent_reviews`
+
+Get recent PR reviews for a repository with verdicts and summaries.
+
+**Parameters:**
+- `repo` (string, required): Full repository name (e.g. `nectr-ai/nectr`)
+- `limit` (integer, optional): Max reviews to return (default 10, capped at 50)
+
+**Returns:**
+```json
+[
+  {
+    "id": 123,
+    "repo": "nectr-ai/nectr",
+    "pr_number": 42,
+    "verdict": "APPROVE_WITH_SUGGESTIONS",
+    "summary": "Strong refactor improving type safety...",
+    "created_at": "2026-03-10T14:30:00Z",
+    "status": "completed"
+  }
+]
+```
+
+**Implementation:**
+```python
+@mcp.tool()
+async def get_recent_reviews(repo: str, limit: int = 10) -> list[dict]:
+    """Get recent PR reviews for a repository with verdicts and summaries."""
+    limit = min(max(1, limit), 50)
+    reviews = await _query_db_reviews(repo, limit)
+    return reviews
+```
+
+#### `get_contributor_stats`
+
+Get top contributors for a repository with PR-touch counts from Neo4j knowledge graph.
+
+**Parameters:**
+- `repo` (string, required): Full repository name
+
+**Returns:**
+```json
+[
+  {"login": "alice", "pr_count": 47},
+  {"login": "bob", "pr_count": 32}
+]
+```
+
+#### `get_pr_verdict`
+
+Get Nectr's AI verdict for a specific pull request.
+
+**Parameters:**
+- `repo` (string, required): Full repository name
+- `pr_number` (integer, required): GitHub PR number
+
+**Returns:**
+```json
+{
+  "repo": "nectr-ai/nectr",
+  "pr_number": 42,
+  "verdict": "APPROVE_WITH_SUGGESTIONS",
+  "summary": "Strong refactor improving type safety. Consider adding tests for edge cases.",
+  "created_at": "2026-03-10T14:30:00Z"
+}
+```
+
+Or if not found:
+```json
+{"error": "No review found for nectr-ai/nectr#42"}
+```
+
+#### `get_repo_health`
+
+Get overall repository health metrics with 0-100 score.
+
+**Parameters:**
+- `repo` (string, required): Full repository name
+
+**Returns:**
+```json
+{
+  "repo": "nectr-ai/nectr",
+  "review_coverage_pct": 85,
+  "avg_merge_time_hours": null,
+  "open_prs_indexed": 17,
+  "health_score": 85,
+  "note": "avg_merge_time_hours requires merge-event tracking (roadmap item)"
+}
+```
+
+**Health Score Calculation:**
+```python
+health_score = min(100, int((reviewed_count / 20) * 100))
+# 20 reviewed PRs = 100% health
+# 10 reviewed PRs = 50% health
+```
+
+### Available Resources
+
+Resources provide read-only access to data streams.
+
+#### `nectr://repos/{repo}/reviews`
+
+Recent reviews for a repository serialized as JSON.
+
+**URI Pattern:** `nectr://repos/<owner>/<repo>/reviews`
+
+**Example:**
+```
+nectr://repos/nectr-ai/nectr/reviews
+```
+
+**Returns:** JSON array of up to 20 recent reviews
+
+### Connecting Claude Desktop
+
+Add Nectr as an MCP server in Claude Desktop's config:
+
+<Steps>
+  <Step title="Open Claude Desktop config">
+    - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+    - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+  </Step>
+  
+  <Step title="Add Nectr MCP server">
+    ```json
+    {
+      "mcpServers": {
+        "nectr": {
+          "url": "https://your-app.up.railway.app/mcp/sse"
+        }
+      }
+    }
+    ```
+  </Step>
+  
+  <Step title="Restart Claude Desktop">
+    Claude will now have access to Nectr's tools during conversations
+  </Step>
+</Steps>
+
+<Note>
+  You can now ask Claude questions like "What's the health score for nectr-ai/nectr?" or "Show me recent PR reviews for my repo" and it will call Nectr's MCP tools.
+</Note>
+
+## Nectr as MCP Client (Inbound)
+
+During PR review, Nectr pulls live context from external MCP servers to ground reviews in what's actually happening.
+
+### Supported Integrations
+
+| Integration | Data Pulled | Configuration |
+|-------------|-------------|---------------|
+| [Linear](/integrations/linear) | Linked issues, task descriptions | `LINEAR_MCP_URL`, `LINEAR_API_KEY` |
+| [Sentry](/integrations/sentry) | Production errors for changed files | `SENTRY_MCP_URL`, `SENTRY_AUTH_TOKEN` |
+| [Slack](/integrations/slack) | Relevant channel messages | `SLACK_MCP_URL` |
+
+### Client Architecture
+
+```python
+class MCPClientManager:
+    """Manages connections to external MCP servers.
+    
+    All methods are async and return plain Python dicts/lists.
+    Gracefully degrades if MCP server is unavailable.
+    """
+
+    async def get_linear_issues(
+        self, team_id: str, query: str
+    ) -> list[dict]:
+        """Pull issues from Linear MCP server."""
+        if not settings.LINEAR_MCP_URL:
+            logger.info("LINEAR_MCP_URL not configured — skipping")
+            return []
+
+        return await self.query_mcp_server(
+            server_url=settings.LINEAR_MCP_URL,
+            tool_name="search_issues",
+            args={"team_id": team_id, "query": query},
+            auth_token=settings.LINEAR_API_KEY,
+        )
+```
+
+### Generic MCP Query Method
+
+The client implements a generic JSON-RPC 2.0 method for calling any MCP server:
+
+```python
+async def query_mcp_server(
+    server_url: str,
+    tool_name: str,
+    args: dict,
+    auth_token: str | None = None,
+) -> list[dict] | dict:
+    """Call any MCP server tool over HTTP/SSE JSON-RPC.
+    
+    Returns:
+        Parsed tool result (list or dict). Empty list on failure.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": args},
+    }
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{server_url.rstrip('/')}/",
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    # Unwrap JSON-RPC result: {"result": {"content": [...]}}
+    result = data.get("result", data)
+    # ... parse MCP content format ...
+```
+
+### Timeout and Error Handling
+
+<Warning>
+  MCP calls have a **10-second timeout** by design. External context is best-effort — a slow MCP server should not block PR review completion.
+</Warning>
+
+```python
+_MCP_TIMEOUT = 10.0  # seconds
+
+try:
+    async with httpx.AsyncClient(timeout=_MCP_TIMEOUT) as client:
+        response = await client.post(...)
+except httpx.TimeoutException:
+    logger.warning(
+        f"MCP call timed out: {server_url} tool={tool_name}"
+    )
+    return []  # Graceful degradation
+except httpx.HTTPStatusError as exc:
+    logger.warning(f"MCP server returned HTTP {exc.response.status_code}")
+    return []
+```
+
+### Usage in PR Review Flow
+
+Here's how MCP context is pulled during a review:
+
+```python
+# 1. Parse PR to identify what context we need
+linear_issue_ids = extract_linear_issue_ids(pr_body)  # e.g., "Fixes ENG-123"
+changed_files = [f["filename"] for f in pr_files]
+
+# 2. Pull MCP context in parallel
+linear_issues, sentry_errors = await asyncio.gather(
+    mcp_client.get_linear_issues(
+        team_id="ENG",
+        query=" ".join(linear_issue_ids),
+    ),
+    mcp_client.get_sentry_errors(
+        project="backend",
+        filename=changed_files[0],  # Check first changed file
+    ),
+)
+
+# 3. Include in review prompt
+context = f"""
+LINEAR CONTEXT:
+{json.dumps(linear_issues, indent=2)}
+
+SENTRY ERRORS:
+{json.dumps(sentry_errors, indent=2)}
+"""
+
+review = await ai_service.review_pr(
+    diff=pr_diff,
+    context=context,
+)
+```
+
+## Environment Variables
+
+### Required for MCP Server (Outbound)
+
+No additional env vars required — FastMCP server is always available.
+
+### Required for MCP Client (Inbound)
+
+All integrations are **optional**. If not configured, that source is silently skipped.
+
+```env
+# Linear integration (optional)
+LINEAR_MCP_URL=https://linear-mcp-server.example.com
+LINEAR_API_KEY=lin_api_...
+
+# Sentry integration (optional)
+SENTRY_MCP_URL=https://sentry-mcp-server.example.com
+SENTRY_AUTH_TOKEN=sntrys_...
+
+# Slack integration (optional)
+SLACK_MCP_URL=https://slack-mcp-server.example.com
+```
+
+## Testing MCP Tools
+
+### Test MCP Server (Outbound)
+
+Use `curl` to call Nectr's MCP tools:
+
+```bash
+# Get recent reviews
+curl -X POST https://your-app.railway.app/mcp/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "get_recent_reviews",
+      "arguments": {"repo": "nectr-ai/nectr", "limit": 5}
+    }
+  }'
+
+# Get repo health
+curl -X POST https://your-app.railway.app/mcp/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "get_repo_health",
+      "arguments": {"repo": "nectr-ai/nectr"}
+    }
+  }'
+```
+
+### Test MCP Client (Inbound)
+
+Create a simple test MCP server:
+
+```python
+# test_mcp_server.py
+from fastapi import FastAPI
+import uvicorn
+
+app = FastAPI()
+
+@app.post("/")
+async def mcp_handler(body: dict):
+    tool_name = body["params"]["name"]
+    args = body["params"]["arguments"]
+    
+    if tool_name == "search_issues":
+        return {
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '[{"id": "ENG-123", "title": "Test issue"}]'
+                    }
+                ]
+            }
+        }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+```
+
+Then configure Nectr to use it:
+```env
+LINEAR_MCP_URL=http://localhost:8001
+```
+
+## Graceful Degradation
+
+All MCP integrations follow a graceful degradation pattern:
+
+<Steps>
+  <Step title="Check if configured">
+    ```python
+    if not settings.LINEAR_MCP_URL:
+        logger.info("LINEAR_MCP_URL not configured — skipping")
+        return []
+    ```
+  </Step>
+  
+  <Step title="Attempt connection with timeout">
+    ```python
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(...)
+    ```
+  </Step>
+  
+  <Step title="Return empty list on failure">
+    ```python
+    except Exception as exc:
+        logger.warning(f"MCP call failed: {exc}")
+        return []  # Review continues without this context
+    ```
+  </Step>
+</Steps>
+
+This means:
+- PR reviews **never fail** due to unavailable MCP servers
+- Missing context is logged but doesn't block the review
+- You can enable/disable integrations without code changes
+
+## Related Files
+
+- `app/mcp/server.py:1` - FastMCP server implementation (outbound)
+- `app/mcp/client.py:35` - MCPClientManager (inbound)
+- `app/mcp/router.py:1` - MCP endpoint documentation
+- `app/services/pr_review_service.py:1` - How MCP context is used in reviews
+- `app/core/config.py:65` - MCP environment variables

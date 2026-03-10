@@ -1,0 +1,498 @@
+---
+title: Environment Variables
+description: Complete reference for all environment variables in Nectr AI PR Review Agent
+---
+
+Nectr uses environment variables for all configuration. Copy `.env.example` to `.env` and configure the required variables to get started.
+
+## Required Variables
+
+These variables must be set for Nectr to start and review PRs.
+
+### AI Configuration
+
+<ParamField path="ANTHROPIC_API_KEY" type="string" required>
+  Your Anthropic API key for Claude Sonnet 4.5.
+  
+  Get your API key from [console.anthropic.com](https://console.anthropic.com)
+  
+  ```bash
+  ANTHROPIC_API_KEY=sk-ant-...
+  ```
+</ParamField>
+
+<ParamField path="ANTHROPIC_MODEL" type="string" default="claude-sonnet-4-5-20250929">
+  The Claude model to use for PR reviews.
+  
+  ```bash
+  ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+  ```
+</ParamField>
+
+### Database
+
+<ParamField path="DATABASE_URL" type="string" required>
+  PostgreSQL connection string with asyncpg driver.
+  
+  **Recommended:** Use [Supabase](https://supabase.com) free tier.
+  
+  Navigate to: Dashboard → Connect → Connection Pooling → Session Mode (port 5432)
+  
+  ```bash
+  DATABASE_URL=postgresql+asyncpg://postgres.<project-id>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+  ```
+  
+  <Warning>
+    Use `postgresql+asyncpg://` (not `postgresql://`) as Nectr requires async database support.
+  </Warning>
+</ParamField>
+
+### GitHub OAuth
+
+<ParamField path="GITHUB_CLIENT_ID" type="string" required>
+  GitHub OAuth App client ID.
+  
+  Create an OAuth App at: [github.com/settings/developers](https://github.com/settings/developers) → New OAuth App
+  
+  ```bash
+  GITHUB_CLIENT_ID=Iv1.abc123...
+  ```
+</ParamField>
+
+<ParamField path="GITHUB_CLIENT_SECRET" type="string" required>
+  GitHub OAuth App client secret.
+  
+  ```bash
+  GITHUB_CLIENT_SECRET=abc123def456...
+  ```
+  
+  <Warning>
+    Keep this secret secure. Never commit it to version control.
+  </Warning>
+</ParamField>
+
+<ParamField path="GITHUB_PAT" type="string" required>
+  GitHub Personal Access Token (Classic) with `repo` scope.
+  
+  Used to post PR review comments on behalf of your account.
+  
+  Create at: [github.com/settings/tokens](https://github.com/settings/tokens) → Generate new token (classic)
+  
+  **Required scope:** `repo` (Full control of private repositories)
+  
+  ```bash
+  GITHUB_PAT=ghp_...
+  ```
+</ParamField>
+
+### Authentication
+
+<ParamField path="SECRET_KEY" type="string" required>
+  Secret key for JWT signing and token encryption.
+  
+  Generate a secure random key:
+  
+  ```bash
+  python -c "import secrets; print(secrets.token_hex(32))"
+  ```
+  
+  ```bash
+  SECRET_KEY=your-64-character-hex-string
+  ```
+  
+  <Warning>
+    Changing this key will invalidate all existing user sessions and require users to re-authenticate.
+  </Warning>
+</ParamField>
+
+<ParamField path="ALGORITHM" type="string" default="HS256">
+  JWT signing algorithm.
+  
+  ```bash
+  ALGORITHM=HS256
+  ```
+</ParamField>
+
+<ParamField path="ACCESS_TOKEN_EXPIRE_MINUTES" type="integer" default="1440">
+  JWT token expiration time in minutes (default: 24 hours).
+  
+  ```bash
+  ACCESS_TOKEN_EXPIRE_MINUTES=1440
+  ```
+</ParamField>
+
+### URLs
+
+<ParamField path="BACKEND_URL" type="string" required>
+  Public URL where your backend API is hosted.
+  
+  This URL is used for:
+  - GitHub webhook callback endpoints
+  - OAuth redirect URIs
+  
+  ```bash
+  # Development
+  BACKEND_URL=http://localhost:8000
+  
+  # Production
+  BACKEND_URL=https://your-backend.up.railway.app
+  ```
+</ParamField>
+
+<ParamField path="FRONTEND_URL" type="string" required>
+  Public URL where your frontend is hosted.
+  
+  Used for redirects after authentication.
+  
+  ```bash
+  # Development
+  FRONTEND_URL=http://localhost:3000
+  
+  # Production
+  FRONTEND_URL=https://your-app.vercel.app
+  ```
+</ParamField>
+
+### Neo4j Knowledge Graph
+
+<ParamField path="NEO4J_URI" type="string" required>
+  Neo4j connection URI.
+  
+  Enables file-expert maps and related-PR context in every review.
+  
+  Get a free instance at: [neo4j.com/cloud/platform/aura-graph-database](https://neo4j.com/cloud/platform/aura-graph-database/)
+  
+  ```bash
+  NEO4J_URI=neo4j+s://xxxxxxxx.databases.neo4j.io
+  ```
+</ParamField>
+
+<ParamField path="NEO4J_USERNAME" type="string" default="neo4j">
+  Neo4j username.
+  
+  ```bash
+  NEO4J_USERNAME=neo4j
+  ```
+</ParamField>
+
+<ParamField path="NEO4J_PASSWORD" type="string" required>
+  Neo4j password.
+  
+  ```bash
+  NEO4J_PASSWORD=your-neo4j-password
+  ```
+</ParamField>
+
+### Mem0 Memory Layer
+
+<ParamField path="MEM0_API_KEY" type="string" required>
+  Mem0 API key for semantic memory storage.
+  
+  Enables per-project patterns and per-developer learned habits.
+  
+  Get your API key at: [mem0.ai](https://mem0.ai)
+  
+  ```bash
+  MEM0_API_KEY=m0-...
+  ```
+</ParamField>
+
+---
+
+## Optional Variables
+
+These variables enable optional features. Leave blank to disable.
+
+### MCP Integrations
+
+Pull live context (issues, errors, messages) into every review. Each integration is independent — set only the ones you use.
+
+<Accordion title="Linear Integration">
+  <ParamField path="LINEAR_MCP_URL" type="string">
+    Linear MCP server base URL.
+    
+    ```bash
+    LINEAR_MCP_URL=https://your-linear-mcp-server.com
+    ```
+  </ParamField>
+  
+  <ParamField path="LINEAR_API_KEY" type="string">
+    Linear personal API key.
+    
+    Get your API key from: Linear → Settings → API → Personal API keys
+    
+    ```bash
+    LINEAR_API_KEY=lin_api_...
+    ```
+  </ParamField>
+</Accordion>
+
+<Accordion title="Sentry Integration">
+  <ParamField path="SENTRY_MCP_URL" type="string">
+    Sentry MCP server base URL.
+    
+    ```bash
+    SENTRY_MCP_URL=https://your-sentry-mcp-server.com
+    ```
+  </ParamField>
+  
+  <ParamField path="SENTRY_AUTH_TOKEN" type="string">
+    Sentry auth token with project read permissions.
+    
+    Create at: Sentry → Settings → Auth Tokens
+    
+    ```bash
+    SENTRY_AUTH_TOKEN=sntrys_...
+    ```
+  </ParamField>
+</Accordion>
+
+<Accordion title="Slack Integration">
+  <ParamField path="SLACK_MCP_URL" type="string">
+    Slack MCP server base URL for fetching relevant channel messages.
+    
+    ```bash
+    SLACK_MCP_URL=https://your-slack-mcp-server.com
+    ```
+  </ParamField>
+</Accordion>
+
+### Slack Bot (Direct Notifications)
+
+<ParamField path="SLACK_BOT_TOKEN" type="string">
+  Slack Bot User OAuth Token for direct notifications.
+  
+  This is separate from the MCP Slack integration above.
+  
+  ```bash
+  SLACK_BOT_TOKEN=xoxb-...
+  ```
+</ParamField>
+
+<ParamField path="SLACK_SIGNING_SECRET" type="string">
+  Slack app signing secret for verifying webhook requests.
+  
+  ```bash
+  SLACK_SIGNING_SECRET=abc123...
+  ```
+</ParamField>
+
+### Webhook Security
+
+<ParamField path="GITHUB_WEBHOOK_SECRET" type="string">
+  Global fallback webhook secret.
+  
+  Per-repo secrets are stored in the database automatically when you connect a repo. This global secret is only used as a fallback if no per-repo secret is found.
+  
+  ```bash
+  GITHUB_WEBHOOK_SECRET=your-webhook-secret
+  ```
+  
+  <Warning>
+    In production (`APP_ENV=production`), webhook signature verification is enforced. Without a valid secret, webhooks will be rejected with a 403 error.
+  </Warning>
+</ParamField>
+
+---
+
+## Feature Flags
+
+<ParamField path="PARALLEL_REVIEW_AGENTS" type="boolean" default="false">
+  Enable parallel review mode with 3 specialized agents.
+  
+  - `false` (default): Single agentic review loop (faster, less token usage)
+  - `true`: 3 specialized agents run in parallel (security / performance / style)
+  
+  ```bash
+  PARALLEL_REVIEW_AGENTS=false
+  ```
+  
+  <Accordion title="How Parallel Agents Work">
+    When enabled, Nectr runs three specialized agents concurrently:
+    
+    1. **Security Agent** - Focuses on vulnerabilities, authentication, data validation
+    2. **Performance Agent** - Analyzes efficiency, database queries, caching
+    3. **Style Agent** - Reviews code style, patterns, and maintainability
+    
+    A synthesis agent then combines all three reviews into a final cohesive review.
+    
+    **Trade-offs:**
+    - ✅ More thorough, specialized analysis
+    - ✅ Parallel execution can be faster for large PRs
+    - ❌ Higher token usage (4x Claude API calls)
+    - ❌ Slightly higher cost per review
+  </Accordion>
+</ParamField>
+
+---
+
+## App Settings
+
+Safe to leave as-is for local development.
+
+<ParamField path="APP_NAME" type="string" default="Nectr">
+  Application name.
+  
+  ```bash
+  APP_NAME=Nectr
+  ```
+</ParamField>
+
+<ParamField path="APP_ENV" type="string" default="development">
+  Application environment.
+  
+  - `development` - Development mode (CORS relaxed, debug enabled)
+  - `production` - Production mode (CORS strict, webhook signature verification enforced)
+  
+  ```bash
+  APP_ENV=development
+  ```
+</ParamField>
+
+<ParamField path="DEBUG" type="boolean" default="true">
+  Enable debug mode.
+  
+  ```bash
+  DEBUG=True
+  ```
+</ParamField>
+
+<ParamField path="LOG_LEVEL" type="string" default="DEBUG">
+  Logging level.
+  
+  Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`
+  
+  ```bash
+  LOG_LEVEL=DEBUG
+  ```
+</ParamField>
+
+<ParamField path="HOST" type="string" default="0.0.0.0">
+  Server host binding.
+  
+  ```bash
+  HOST=0.0.0.0
+  ```
+</ParamField>
+
+<ParamField path="PORT" type="integer" default="8000">
+  Server port.
+  
+  ```bash
+  PORT=8000
+  ```
+</ParamField>
+
+---
+
+## Example Configuration
+
+<Accordion title="Minimal Configuration (Required Only)">
+  ```bash
+  # AI
+  ANTHROPIC_API_KEY=sk-ant-api03-xxx
+  ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+  
+  # Database
+  DATABASE_URL=postgresql+asyncpg://postgres.abc:pass@aws-0-us-east-1.pooler.supabase.com:5432/postgres
+  
+  # GitHub OAuth
+  GITHUB_CLIENT_ID=Iv1.abc123
+  GITHUB_CLIENT_SECRET=secret123
+  GITHUB_PAT=ghp_abc123
+  
+  # Auth
+  SECRET_KEY=64-character-random-hex-string
+  
+  # URLs
+  BACKEND_URL=http://localhost:8000
+  FRONTEND_URL=http://localhost:3000
+  
+  # Neo4j
+  NEO4J_URI=neo4j+s://abc123.databases.neo4j.io
+  NEO4J_USERNAME=neo4j
+  NEO4J_PASSWORD=password
+  
+  # Mem0
+  MEM0_API_KEY=m0-abc123
+  ```
+</Accordion>
+
+<Accordion title="Full Configuration (All Features)">
+  ```bash
+  # ══════════════════════════════════════════════════════
+  # REQUIRED
+  # ══════════════════════════════════════════════════════
+  
+  # AI
+  ANTHROPIC_API_KEY=sk-ant-api03-xxx
+  ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+  
+  # Database
+  DATABASE_URL=postgresql+asyncpg://postgres.abc:pass@aws-0-us-east-1.pooler.supabase.com:5432/postgres
+  
+  # GitHub OAuth + API
+  GITHUB_CLIENT_ID=Iv1.abc123
+  GITHUB_CLIENT_SECRET=secret123
+  GITHUB_PAT=ghp_abc123
+  
+  # Auth
+  SECRET_KEY=64-character-random-hex-string
+  ACCESS_TOKEN_EXPIRE_MINUTES=1440
+  ALGORITHM=HS256
+  
+  # URLs
+  BACKEND_URL=https://your-backend.up.railway.app
+  FRONTEND_URL=https://your-app.vercel.app
+  
+  # Neo4j
+  NEO4J_URI=neo4j+s://abc123.databases.neo4j.io
+  NEO4J_USERNAME=neo4j
+  NEO4J_PASSWORD=password
+  
+  # Mem0
+  MEM0_API_KEY=m0-abc123
+  
+  # ══════════════════════════════════════════════════════
+  # OPTIONAL
+  # ══════════════════════════════════════════════════════
+  
+  # MCP Integrations
+  LINEAR_MCP_URL=https://linear-mcp.example.com
+  LINEAR_API_KEY=lin_api_abc123
+  SENTRY_MCP_URL=https://sentry-mcp.example.com
+  SENTRY_AUTH_TOKEN=sntrys_abc123
+  SLACK_MCP_URL=https://slack-mcp.example.com
+  
+  # Slack Bot (Direct Notifications)
+  SLACK_BOT_TOKEN=xoxb-abc123
+  SLACK_SIGNING_SECRET=abc123
+  
+  # Webhook Security
+  GITHUB_WEBHOOK_SECRET=webhook-secret-123
+  
+  # Feature Flags
+  PARALLEL_REVIEW_AGENTS=false
+  
+  # App Settings
+  APP_NAME=Nectr
+  APP_ENV=production
+  DEBUG=False
+  LOG_LEVEL=INFO
+  HOST=0.0.0.0
+  PORT=8000
+  ```
+</Accordion>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="OAuth Setup" icon="github" href="/configuration/oauth-setup">
+    Configure GitHub OAuth App for user authentication
+  </Card>
+  <Card title="Webhooks" icon="webhook" href="/configuration/webhooks">
+    Learn how webhooks are configured and verified
+  </Card>
+</CardGroup>

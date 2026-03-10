@@ -1,0 +1,136 @@
+---
+title: "GitHub OAuth"
+description: "GitHub OAuth authentication flow endpoints"
+---
+
+## Initiate GitHub OAuth
+
+<RequestExample>
+```bash Request
+GET /auth/github
+```
+</RequestExample>
+
+Initiates the GitHub OAuth flow by redirecting the user to GitHub's authorization page.
+
+### Behavior
+
+1. Generates a random CSRF state token (32 bytes, URL-safe)
+2. Stores the state in the database with a 10-minute expiration
+3. Cleans up expired OAuth states
+4. Redirects to GitHub OAuth with required scopes
+
+### OAuth Scopes
+
+- `repo` - Full control of private repositories
+- `read:user` - Read user profile data
+- `user:email` - Access user email addresses
+- `read:org` - Read organization membership
+
+### Response
+
+<ResponseField name="redirect" type="RedirectResponse">
+  Redirects to `https://github.com/login/oauth/authorize` with:
+  - `client_id` - Application's GitHub client ID
+  - `scope` - Required OAuth scopes
+  - `state` - CSRF protection token
+</ResponseField>
+
+---
+
+## GitHub OAuth Callback
+
+<RequestExample>
+```bash Request
+GET /auth/github/callback?code=abc123&state=xyz789
+```
+</RequestExample>
+
+Handles the OAuth callback from GitHub after user authorization.
+
+### Query Parameters
+
+<ParamField query="code" type="string" required>
+  Authorization code from GitHub
+</ParamField>
+
+<ParamField query="state" type="string" required>
+  CSRF state token that matches the one stored in the database
+</ParamField>
+
+### Behavior
+
+1. Validates the state token against the database
+2. Exchanges the authorization code for a GitHub access token
+3. Fetches the user's GitHub profile
+4. Creates or updates the user in the database
+5. Encrypts and stores the GitHub access token
+6. Generates a JWT access token
+7. Sets the JWT as an httpOnly cookie
+8. Redirects to the frontend dashboard
+
+### Response
+
+<ResponseField name="redirect" type="RedirectResponse">
+  Redirects to `{FRONTEND_URL}/dashboard` with:
+  - `access_token` cookie (httpOnly, secure in production)
+  - Cookie max age: `ACCESS_TOKEN_EXPIRE_MINUTES * 60` seconds
+  - SameSite: `none` (production) or `lax` (development)
+</ResponseField>
+
+### Error Responses
+
+<ResponseField name="400" type="error">
+  **Invalid or expired OAuth state** - The state token is missing, invalid, or expired
+</ResponseField>
+
+<ResponseField name="400" type="error">
+  **Failed to exchange GitHub code** - GitHub token exchange failed
+</ResponseField>
+
+<ResponseField name="400" type="error">
+  **Failed to fetch GitHub user** - Unable to retrieve GitHub user profile
+</ResponseField>
+
+---
+
+## Reconnect GitHub Account
+
+<RequestExample>
+```bash Request
+GET /auth/github/reconnect
+Cookie: access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+</RequestExample>
+
+Revokes the current GitHub OAuth token and initiates a fresh OAuth flow. Use this when the user needs to grant access to a new organization.
+
+### Authentication
+
+<ParamField header="Cookie" type="string" required>
+  `access_token` - JWT token in httpOnly cookie
+</ParamField>
+
+### Behavior
+
+1. Decrypts the stored GitHub access token
+2. Revokes the token with GitHub
+3. Deletes the JWT cookie
+4. Generates a new CSRF state token
+5. Redirects to GitHub OAuth authorization page
+
+### Response
+
+<ResponseField name="redirect" type="RedirectResponse">
+  Redirects to GitHub OAuth with:
+  - Deleted `access_token` cookie
+  - New OAuth flow initiated
+</ResponseField>
+
+<ResponseField name="401" type="error">
+  **Not authenticated** - Missing or invalid JWT token
+</ResponseField>
+
+<Note>
+  Token revocation failures are logged but don't prevent the reconnection flow from continuing.
+</Note>
