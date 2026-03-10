@@ -98,11 +98,20 @@
             ]
           },
           {
+            "group": "Events",
+            "pages": [
+              "api/events/list",
+              "api/events/details"
+            ]
+          },
+          {
             "group": "Analytics",
             "pages": [
               "api/analytics/summary",
               "api/analytics/contributors",
-              "api/analytics/timeline"
+              "api/analytics/timeline",
+              "api/analytics/insights",
+              "api/analytics/graph"
             ]
           },
           {
@@ -111,7 +120,9 @@
               "api/memory/list",
               "api/memory/create",
               "api/memory/delete",
-              "api/memory/project-map"
+              "api/memory/project-map",
+              "api/memory/stats",
+              "api/memory/rescan"
             ]
           },
           {

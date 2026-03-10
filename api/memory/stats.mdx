@@ -1,0 +1,147 @@
+---
+title: "Memory Statistics"
+description: "Get memory counts by type for a repository"
+---
+
+## Endpoint
+
+```
+GET /api/v1/memory/stats
+```
+
+Returns aggregated statistics about memories stored for a specific repository, including total count and breakdown by memory type.
+
+## Authentication
+
+Requires a valid JWT token in cookies (obtained via GitHub OAuth).
+
+## Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository in `owner/repo` format (must be connected to your account)
+</ParamField>
+
+## Response
+
+<ResponseField name="repo" type="string">
+  Repository full name (owner/repo)
+</ResponseField>
+
+<ResponseField name="total" type="integer">
+  Total number of memories stored for this repository
+</ResponseField>
+
+<ResponseField name="by_type" type="object">
+  Count of memories by type
+  
+  <Expandable title="memory types">
+    <ResponseField name="project_pattern" type="integer">
+      Architectural patterns and conventions
+    </ResponseField>
+    <ResponseField name="decision" type="integer">
+      Important technical decisions
+    </ResponseField>
+    <ResponseField name="developer_pattern" type="integer">
+      Individual developer coding patterns
+    </ResponseField>
+    <ResponseField name="developer_strength" type="integer">
+      Developer expertise areas
+    </ResponseField>
+    <ResponseField name="risk_module" type="integer">
+      High-risk code areas
+    </ResponseField>
+    <ResponseField name="contributor_profile" type="integer">
+      Developer profiles and habits
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl "https://your-backend.railway.app/api/v1/memory/stats?repo=myorg/backend" \
+  -H "Cookie: access_token=your_jwt_token"
+```
+
+```python Python
+import httpx
+
+async with httpx.AsyncClient() as client:
+    response = await client.get(
+        "https://your-backend.railway.app/api/v1/memory/stats",
+        params={"repo": "myorg/backend"},
+        cookies={"access_token": "your_jwt_token"}
+    )
+    stats = response.json()
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://your-backend.railway.app/api/v1/memory/stats?repo=myorg/backend',
+  { credentials: 'include' }
+);
+const stats = await response.json();
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "repo": "myorg/backend",
+  "total": 127,
+  "by_type": {
+    "project_pattern": 45,
+    "decision": 23,
+    "developer_pattern": 18,
+    "developer_strength": 22,
+    "risk_module": 12,
+    "contributor_profile": 7
+  }
+}
+```
+
+## Use Cases
+
+- **Memory Overview**: Quickly understand what has been learned about a repository
+- **Memory Health**: Track memory accumulation over time
+- **Pattern Analysis**: Identify which types of memories are most common
+- **Memory Management**: Determine if a repository needs memory cleanup or reindexing
+
+## Error Responses
+
+<CodeGroup>
+
+```json 400 Bad Request
+{
+  "detail": "repo must be owner/repo"
+}
+```
+
+```json 403 Forbidden
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+```json 401 Unauthorized
+{
+  "detail": "Not authenticated"
+}
+```
+
+</CodeGroup>
+
+## Related Endpoints
+
+<CardGroup cols={2}>
+  <Card title="List Memories" icon="list" href="/api/memory/list">
+    Browse all memories for a repository
+  </Card>
+  <Card title="Rescan Repository" icon="arrows-rotate" href="/api/memory/rescan">
+    Rebuild memories from scratch
+  </Card>
+</CardGroup>

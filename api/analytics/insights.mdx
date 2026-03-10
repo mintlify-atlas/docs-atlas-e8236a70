@@ -1,0 +1,250 @@
+---
+title: "Analytics Insights"
+description: "Rich analytics including merge time, per-author stats, verdict breakdown, and issue categories"
+---
+
+## Endpoint
+
+```
+GET /api/v1/analytics/insights
+```
+
+Returns comprehensive analytics insights including merge time metrics, per-author statistics, AI verdict breakdown, confidence distribution, issue categories, and per-repository breakdown.
+
+## Authentication
+
+Requires a valid JWT token in cookies (obtained via GitHub OAuth).
+
+## Query Parameters
+
+<ParamField query="days" type="integer" default={30}>
+  Number of days to analyze (7-90)
+</ParamField>
+
+## Response
+
+<ResponseField name="period" type="object">
+  Analysis time period
+  
+  <Expandable title="properties">
+    <ResponseField name="start" type="string">
+      Start date (ISO 8601)
+    </ResponseField>
+    <ResponseField name="end" type="string">
+      End date (ISO 8601)
+    </ResponseField>
+    <ResponseField name="days" type="integer">
+      Number of days analyzed
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="merge_metrics" type="object">
+  Pull request merge time statistics
+  
+  <Expandable title="properties">
+    <ResponseField name="median_hours" type="number">
+      Median time from PR creation to merge
+    </ResponseField>
+    <ResponseField name="p90_hours" type="number">
+      90th percentile merge time
+    </ResponseField>
+    <ResponseField name="count" type="integer">
+      Number of merged PRs analyzed
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="authors" type="array">
+  Per-author statistics sorted by PR count
+  
+  <Expandable title="properties">
+    <ResponseField name="author" type="string">
+      GitHub username
+    </ResponseField>
+    <ResponseField name="prs" type="integer">
+      Total PRs created
+    </ResponseField>
+    <ResponseField name="merged" type="integer">
+      Number of merged PRs
+    </ResponseField>
+    <ResponseField name="issues_flagged" type="integer">
+      Total issues identified in reviews
+    </ResponseField>
+    <ResponseField name="avg_confidence" type="number">
+      Average AI review confidence (1-5)
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="verdicts" type="object">
+  AI review verdict distribution
+  
+  <Expandable title="properties">
+    <ResponseField name="APPROVE" type="integer">
+      Number of approved PRs
+    </ResponseField>
+    <ResponseField name="REQUEST_CHANGES" type="integer">
+      Number of PRs requesting changes
+    </ResponseField>
+    <ResponseField name="NEEDS_DISCUSSION" type="integer">
+      Number of PRs needing discussion
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="confidence_dist" type="object">
+  AI confidence score distribution (1=low, 5=high)
+</ResponseField>
+
+<ResponseField name="issue_categories" type="object">
+  Issue severity breakdown
+  
+  <Expandable title="properties">
+    <ResponseField name="critical" type="integer">
+      Critical issues found
+    </ResponseField>
+    <ResponseField name="moderate" type="integer">
+      Moderate issues found
+    </ResponseField>
+    <ResponseField name="minor" type="integer">
+      Minor issues found
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="repos" type="array">
+  Per-repository metrics sorted by PR count
+  
+  <Expandable title="properties">
+    <ResponseField name="repo" type="string">
+      Repository full name (owner/repo)
+    </ResponseField>
+    <ResponseField name="prs" type="integer">
+      Number of PRs
+    </ResponseField>
+    <ResponseField name="merged" type="integer">
+      Number of merged PRs
+    </ResponseField>
+    <ResponseField name="issues_flagged" type="integer">
+      Total issues flagged
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="pr_size" type="object">
+  PR size distribution (lines changed)
+  
+  <Expandable title="properties">
+    <ResponseField name="median" type="integer">
+      Median lines changed
+    </ResponseField>
+    <ResponseField name="p90" type="integer">
+      90th percentile size
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl "https://your-backend.railway.app/api/v1/analytics/insights?days=30" \
+  -H "Cookie: access_token=your_jwt_token"
+```
+
+```python Python
+import httpx
+
+async with httpx.AsyncClient() as client:
+    response = await client.get(
+        "https://your-backend.railway.app/api/v1/analytics/insights",
+        params={"days": 30},
+        cookies={"access_token": "your_jwt_token"}
+    )
+    insights = response.json()
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://your-backend.railway.app/api/v1/analytics/insights?days=30',
+  { credentials: 'include' }
+);
+const insights = await response.json();
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "period": {
+    "start": "2026-02-08T00:00:00Z",
+    "end": "2026-03-10T00:00:00Z",
+    "days": 30
+  },
+  "merge_metrics": {
+    "median_hours": 4.2,
+    "p90_hours": 24.5,
+    "count": 45
+  },
+  "authors": [
+    {
+      "author": "alice",
+      "prs": 12,
+      "merged": 10,
+      "issues_flagged": 8,
+      "avg_confidence": 4.2
+    }
+  ],
+  "verdicts": {
+    "APPROVE": 30,
+    "REQUEST_CHANGES": 12,
+    "NEEDS_DISCUSSION": 3
+  },
+  "confidence_dist": {
+    "1": 0,
+    "2": 2,
+    "3": 8,
+    "4": 20,
+    "5": 15
+  },
+  "issue_categories": {
+    "critical": 5,
+    "moderate": 18,
+    "minor": 32
+  },
+  "repos": [
+    {
+      "repo": "myorg/backend",
+      "prs": 28,
+      "merged": 24,
+      "issues_flagged": 35
+    }
+  ],
+  "pr_size": {
+    "median": 145,
+    "p90": 580
+  }
+}
+```
+
+## Use Cases
+
+- **Team Performance**: Track merge times and author productivity
+- **Quality Metrics**: Monitor AI review verdicts and issue severity
+- **Process Optimization**: Identify bottlenecks in PR review process
+- **Repository Health**: Compare activity and quality across repositories
+
+## Related Endpoints
+
+<CardGroup cols={2}>
+  <Card title="Summary Analytics" icon="chart-simple" href="/api/analytics/summary">
+    High-level metrics overview
+  </Card>
+  <Card title="Contributors" icon="users" href="/api/analytics/contributors">
+    Detailed contributor profiles from AI memory
+  </Card>
+</CardGroup>

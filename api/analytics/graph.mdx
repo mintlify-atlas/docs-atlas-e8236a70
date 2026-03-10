@@ -1,0 +1,251 @@
+---
+title: "Graph Analytics"
+description: "Repository intelligence from Neo4j graph and GitHub API"
+---
+
+## Endpoint
+
+```
+GET /api/v1/analytics/graph
+```
+
+Returns comprehensive repository intelligence combining Neo4j graph data with GitHub API metrics, including language distribution, file hotspots, high-risk files, code ownership, and developer expertise.
+
+## Authentication
+
+Requires a valid JWT token in cookies (obtained via GitHub OAuth).
+
+## Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository in `owner/repo` format (must be connected to your account)
+</ParamField>
+
+## Response
+
+<ResponseField name="repo" type="string">
+  Repository full name (owner/repo)
+</ResponseField>
+
+<ResponseField name="languages" type="array">
+  Programming language distribution (from GitHub API - byte-accurate)
+  
+  <Expandable title="properties">
+    <ResponseField name="name" type="string">
+      Language name (e.g., "Python", "TypeScript")
+    </ResponseField>
+    <ResponseField name="bytes" type="integer">
+      Total bytes of code
+    </ResponseField>
+    <ResponseField name="pct" type="number">
+      Percentage of total codebase
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="hotspots" type="array">
+  Most PR-touched files (from Neo4j graph)
+  
+  <Expandable title="properties">
+    <ResponseField name="path" type="string">
+      File path
+    </ResponseField>
+    <ResponseField name="touch_count" type="integer">
+      Number of PRs that modified this file
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="high_risk" type="array">
+  Files with most REQUEST_CHANGES verdicts
+  
+  <Expandable title="properties">
+    <ResponseField name="path" type="string">
+      File path
+    </ResponseField>
+    <ResponseField name="risk_score" type="integer">
+      Number of REQUEST_CHANGES reviews
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="dead_files" type="object">
+  Files never touched by reviewed PRs
+  
+  <Expandable title="properties">
+    <ResponseField name="count" type="integer">
+      Total number of dead files
+    </ResponseField>
+    <ResponseField name="sample" type="array">
+      Sample file paths (up to 10)
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="ownership" type="array">
+  Code ownership by file (file → dominant contributor)
+  
+  <Expandable title="properties">
+    <ResponseField name="path" type="string">
+      File path
+    </ResponseField>
+    <ResponseField name="owner" type="string">
+      GitHub username of primary contributor
+    </ResponseField>
+    <ResponseField name="touch_pct" type="number">
+      Percentage of PRs by this owner
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="expertise" type="array">
+  Developer expertise areas (per dev: top directories)
+  
+  <Expandable title="properties">
+    <ResponseField name="login" type="string">
+      GitHub username
+    </ResponseField>
+    <ResponseField name="top_dirs" type="array">
+      Top 3 directories this developer works in
+    </ResponseField>
+    <ResponseField name="total_touches" type="integer">
+      Total PR contributions
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="contributors" type="array">
+  Top contributors (from GitHub /stats/contributors API - default branch, all time)
+  
+  <Expandable title="properties">
+    <ResponseField name="login" type="string">
+      GitHub username
+    </ResponseField>
+    <ResponseField name="commits" type="integer">
+      Total commits on default branch
+    </ResponseField>
+    <ResponseField name="additions" type="integer">
+      Total lines added
+    </ResponseField>
+    <ResponseField name="deletions" type="integer">
+      Total lines deleted
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl "https://your-backend.railway.app/api/v1/analytics/graph?repo=myorg/backend" \
+  -H "Cookie: access_token=your_jwt_token"
+```
+
+```python Python
+import httpx
+
+async with httpx.AsyncClient() as client:
+    response = await client.get(
+        "https://your-backend.railway.app/api/v1/analytics/graph",
+        params={"repo": "myorg/backend"},
+        cookies={"access_token": "your_jwt_token"}
+    )
+    graph_data = response.json()
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://your-backend.railway.app/api/v1/analytics/graph?repo=myorg/backend',
+  { credentials: 'include' }
+);
+const graphData = await response.json();
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "repo": "myorg/backend",
+  "languages": [
+    { "name": "Python", "bytes": 244896, "pct": 52.3 },
+    { "name": "TypeScript", "bytes": 225830, "pct": 48.2 }
+  ],
+  "hotspots": [
+    { "path": "app/services/pr_review_service.py", "touch_count": 42 },
+    { "path": "app/api/v1/repos.py", "touch_count": 28 }
+  ],
+  "high_risk": [
+    { "path": "app/auth/jwt_utils.py", "risk_score": 8 },
+    { "path": "app/services/ai_service.py", "risk_score": 6 }
+  ],
+  "dead_files": {
+    "count": 23,
+    "sample": ["tests/legacy/old_test.py", "scripts/deprecated.sh"]
+  },
+  "ownership": [
+    { "path": "app/main.py", "owner": "alice", "touch_pct": 75.0 },
+    { "path": "app/core/config.py", "owner": "bob", "touch_pct": 60.0 }
+  ],
+  "expertise": [
+    {
+      "login": "alice",
+      "top_dirs": ["app/services", "app/api", "app/core"],
+      "total_touches": 65
+    }
+  ],
+  "contributors": [
+    {
+      "login": "alice",
+      "commits": 342,
+      "additions": 15680,
+      "deletions": 8420
+    }
+  ]
+}
+```
+
+## Use Cases
+
+- **Code Ownership**: Identify which developer owns which parts of the codebase
+- **Risk Management**: Find files that frequently cause review issues
+- **Refactoring**: Identify hotspots and dead code for cleanup
+- **Team Planning**: Understand developer expertise areas
+- **Language Analysis**: Track technology stack composition
+
+## Error Responses
+
+<CodeGroup>
+
+```json 400 Bad Request
+{
+  "detail": "repo must be in 'owner/repo' format"
+}
+```
+
+```json 403 Forbidden
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+```json 401 Unauthorized
+{
+  "detail": "Not authenticated"
+}
+```
+
+</CodeGroup>
+
+## Related Endpoints
+
+<CardGroup cols={2}>
+  <Card title="Analytics Insights" icon="chart-line" href="/api/analytics/insights">
+    Cross-repository analytics and metrics
+  </Card>
+  <Card title="Neo4j Graph" icon="share-2" href="/architecture/neo4j-graph">
+    Learn about the knowledge graph structure
+  </Card>
+</CardGroup>

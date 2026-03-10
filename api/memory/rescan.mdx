@@ -1,0 +1,168 @@
+---
+title: "Rescan Repository"
+description: "Re-run the project scanner to rebuild memories from scratch"
+---
+
+## Endpoint
+
+```
+POST /api/v1/memory/rescan
+```
+
+Triggers a background task to re-scan the repository and rebuild the project memory map. This is useful when you've made significant structural changes to your codebase or want to refresh the AI's understanding of your project.
+
+## Authentication
+
+Requires a valid JWT token in cookies (obtained via GitHub OAuth).
+
+## Query Parameters
+
+<ParamField query="repo" type="string" required>
+  Repository in `owner/repo` format (must be connected to your account)
+</ParamField>
+
+## Response
+
+<ResponseField name="status" type="string">
+  Always returns `rescan_started` on success
+</ResponseField>
+
+<ResponseField name="repo" type="string">
+  Repository full name that was rescanned
+</ResponseField>
+
+## What Gets Rescanned
+
+The rescan process performs the following operations:
+
+1. **File Tree Analysis**: Scans the entire repository structure on the default branch
+2. **README Parsing**: Extracts architecture notes and conventions from README files
+3. **Configuration Analysis**: Analyzes build configs, package managers, and tooling
+4. **Framework Detection**: Identifies web frameworks, ORMs, and key dependencies
+5. **Memory Extraction**: Uses Claude to extract architectural patterns and conventions
+6. **Memory Storage**: Stores extracted knowledge in Mem0 with appropriate scoping
+
+<Note>
+The rescan runs asynchronously in the background. Existing memories are preserved unless they're superseded by new scans. The process typically takes 30-60 seconds for medium-sized repositories.
+</Note>
+
+## Example Request
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST "https://your-backend.railway.app/api/v1/memory/rescan?repo=myorg/backend" \
+  -H "Cookie: access_token=your_jwt_token"
+```
+
+```python Python
+import httpx
+
+async with httpx.AsyncClient() as client:
+    response = await client.post(
+        "https://your-backend.railway.app/api/v1/memory/rescan",
+        params={"repo": "myorg/backend"},
+        cookies={"access_token": "your_jwt_token"}
+    )
+    result = response.json()
+    print(result)  # {"status": "rescan_started", "repo": "myorg/backend"}
+```
+
+```javascript JavaScript
+const response = await fetch(
+  'https://your-backend.railway.app/api/v1/memory/rescan?repo=myorg/backend',
+  {
+    method: 'POST',
+    credentials: 'include',
+  }
+);
+const result = await response.json();
+```
+
+</CodeGroup>
+
+## Example Response
+
+```json
+{
+  "status": "rescan_started",
+  "repo": "myorg/backend"
+}
+```
+
+## When to Use Rescan
+
+<Accordion title="Repository Structure Changed">
+  After major refactoring or reorganizing your directory structure, rescan ensures the AI has the latest project layout.
+</Accordion>
+
+<Accordion title="README or Docs Updated">
+  If you've updated architectural documentation, conventions, or coding standards in your README or docs, rescan picks up the changes.
+</Accordion>
+
+<Accordion title="New Framework or Tools Added">
+  When adopting new frameworks, ORMs, or significant dependencies, rescan helps the AI understand the new patterns.
+</Accordion>
+
+<Accordion title="Initial Connection Issues">
+  If the initial repo scan failed or was interrupted, you can manually trigger a rescan.
+</Accordion>
+
+<Accordion title="Memory Debugging">
+  If you suspect the AI has outdated or incorrect information about your project, rescan refreshes the knowledge base.
+</Accordion>
+
+## Error Responses
+
+<CodeGroup>
+
+```json 400 Bad Request
+{
+  "detail": "repo must be owner/repo"
+}
+```
+
+```json 403 Forbidden
+{
+  "detail": "Repo not connected or access denied"
+}
+```
+
+```json 503 Service Unavailable
+{
+  "detail": "Memory layer not configured"
+}
+```
+
+```json 401 Unauthorized
+{
+  "detail": "Not authenticated"
+}
+```
+
+</CodeGroup>
+
+## Monitoring Rescan Progress
+
+To check if the rescan completed, use the memory stats endpoint:
+
+```bash
+curl "https://your-backend.railway.app/api/v1/memory/stats?repo=myorg/backend" \
+  -H "Cookie: access_token=your_jwt_token"
+```
+
+Compare the `total` count before and after rescanning to verify new memories were created.
+
+## Related Endpoints
+
+<CardGroup cols={2}>
+  <Card title="Memory Stats" icon="chart-simple" href="/api/memory/stats">
+    View memory statistics by type
+  </Card>
+  <Card title="Project Map" icon="map" href="/api/memory/project-map">
+    View the extracted project knowledge
+  </Card>
+  <Card title="List Memories" icon="list" href="/api/memory/list">
+    Browse all memories for debugging
+  </Card>
+</CardGroup>
